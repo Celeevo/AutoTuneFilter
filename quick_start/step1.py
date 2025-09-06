@@ -5,7 +5,7 @@ import datetime
 class TestStrategy(bt.Strategy):
 
     def log(self, txt, dt=None):
-        ''' Функция логирования событий Стратегии'''
+        # Функция логирования событий Стратегии
         dt = dt or self.data.datetime.date(0)
         print(f'{dt.isoformat()}, {txt}')
 
