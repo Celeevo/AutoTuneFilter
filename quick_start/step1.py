@@ -12,6 +12,12 @@ class TestStrategy(bt.Strategy):
     def next(self):
         # Просто выводим цену закрытия каждого дня
         self.log(f'Close: {self.data.close[0]}')
+        # текущее значение close меньше предыдущего close
+        if self.data.close[0] < self.data.close[-1]:
+            # предыдущее close меньше пред-предыдущего close
+            if self.data.close[-1] < self.data.close[-2]:
+                self.log(f'Покупаем! {self.data.close[0]}')
+                self.buy()
 
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
@@ -37,7 +43,7 @@ if __name__ == '__main__':
         low=4,
         close=5,
         volume=6,
-        # -1 означает отсутсвие данных в файле
+        # -1 означает отсутствие данных в файле
         openinterest=-1
     )
 
@@ -47,4 +53,5 @@ if __name__ == '__main__':
 
     print(f'Стартовый капитал: {cerebro.broker.getvalue()}')
     cerebro.run()
+    cerebro.plot()
     print(f'Финальный капитал: {cerebro.broker.getvalue()}')
