@@ -7,10 +7,11 @@ class TestStrategy(bt.Strategy):
         ('maperiod', 15),
     )
 
-    def log(self, txt, dt=None):
+    def log(self, txt, dt=None, doprint=False):
         # Функция логирования событий Стратегии
-        dt = dt or self.data.datetime.date(0)
-        print(f'{dt.isoformat()}, {txt}')
+        if doprint:
+            dt = dt or self.data.datetime.date(0)
+            print(f'{dt.isoformat()}, {txt}')
 
     def __init__(self):
         # Для отслеживания размещенных Ордеров
@@ -72,6 +73,11 @@ class TestStrategy(bt.Strategy):
                 # чтобы не создавать еще
                 self.order = self.sell()
 
+    def stop(self):
+        self.log(f'MA Period = {self.params.maperiod}, '
+                 f'Финальный капитал = {self.broker.getvalue():.2f}',
+                 doprint=True)
+
 if __name__ == '__main__':
     cerebro = bt.Cerebro()
     # установим свой стартовый капитал
@@ -96,12 +102,13 @@ if __name__ == '__main__':
 
     # добавляем источник данных в движок
     cerebro.adddata(data)
-    cerebro.addstrategy(TestStrategy)
+
+    strats = cerebro.optstrategy(
+        TestStrategy,
+        maperiod=range(3, 16))
+
     # разделите 0,1% на 100, чтобы убрать %
     cerebro.broker.setcommission(commission=0.001)
-    cerebro.addsizer(bt.sizers.FixedSize, stake=10)
+    cerebro.addsizer(bt.sizers.FixedSize, stake=200)
 
-    print(f'Стартовый капитал: {cerebro.broker.getvalue()}')
     cerebro.run()
-    cerebro.plot()
-    print(f'Финальный капитал: {cerebro.broker.getvalue():.2f}')
