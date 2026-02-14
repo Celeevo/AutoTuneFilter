@@ -18,11 +18,11 @@ class TestStrategy(bt.Strategy):
         ('maperiod', 15),
     )
 
-    def log(self, txt, dt=None, doprint=False):
+    def log(self, txt, doprint=False):
         # Функция логирования событий Стратегии
         if doprint:
-            dt = dt or self.data.datetime.date(0)
-            print(f'{dt.isoformat()}, {txt}')
+            dt = self.data.datetime.date(0).isoformat()
+            print(f'{dt}, {txt}')
 
     def __init__(self):
         # Для отслеживания размещенных Ордеров

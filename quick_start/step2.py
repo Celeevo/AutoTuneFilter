@@ -13,10 +13,10 @@ import datetime
 class TestStrategy(bt.Strategy):
     params = (('exitbars', 5),)
 
-    def log(self, txt, dt=None):
+    def log(self, txt):
         # Функция логирования событий Стратегии
-        dt = dt or self.data.datetime.date(0)
-        print(f'{dt.isoformat()}, {txt}')
+        dt = self.data.datetime.date(0).isoformat()
+        print(f'{dt}, {txt}')
 
     def __init__(self):
         # Для отслеживания размещенных Ордеров
