@@ -59,4 +59,5 @@ if __name__ == '__main__':
     print(f'Стартовый капитал: {cerebro.broker.getvalue()}')
     cerebro.run()
     cerebro.plot()
+    # cerebro.plot(iplot=False)
     print(f'Финальный капитал: {cerebro.broker.getvalue()}')
