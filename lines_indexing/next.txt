@@ -1,0 +1,120 @@
+0001 | 20:40:03.810 | IND(SMA).next | SMA period=10 | bar start time = 20:39 | sma=298.839000
+0002 | 20:40:03.810 | IND(SMA).next | SMA period=20 | bar start time = 20:39 | sma=298.836000
+0003 | 20:40:03.811 | STRATEGY.notify_cashvalue cash=599991.91 value=0.00
+0004 | 20:40:03.811 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 20:39:00, 298.86, 298.89, 298.86, 298.87, 5777.0; buysig = 1.0
+0005 | 20:40:03.814 | ANALYZER.next | bar start time = 20:39
+--------------------------------------------------
+11-01-26 20:40:03 - trace_metods_last.py - notify_data - 132 - Источник данных: QJSIM.SBER, статус: LIVE
+0001 | 20:40:03.826 | STRATEGY.notify_order status=Submitted ref=1
+0002 | 20:40:03.826 | ANALYZER.notify_order status=Submitted ref=1
+0003 | 20:40:03.933 | STRATEGY.notify_order status=Accepted ref=1
+0004 | 20:40:03.933 | ANALYZER.notify_order status=Accepted ref=1
+11-01-26 20:40:04 - trace_metods_last.py - notify_order - 140 - Ордер на покупку 2 бумаг QJSIM.SBER выполнен по цене 298.87 за бумагу. Новая позиция по инструменту: 2
+0005 | 20:40:04.772 | STRATEGY.notify_order status=Completed ref=1
+0006 | 20:40:04.772 | ANALYZER.notify_order status=Completed ref=1
+0007 | 20:40:04.772 | STRATEGY.notify_trade pnl=0.00
+0008 | 20:40:04.772 | ANALYZER.notify_trade pnl=0.00
+0009 | 20:41:01.682 | IND(SMA).next | SMA period=10 | bar start time = 20:40 | sma=298.840000
+0010 | 20:41:01.682 | IND(SMA).next | SMA period=20 | bar start time = 20:40 | sma=298.828500
+0011 | 20:41:01.683 | STRATEGY.notify_cashvalue cash=599394.04 value=597.70
+0012 | 20:41:01.683 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 20:40:00, 298.87, 298.87, 298.84, 298.85, 8649.0; buysig = 0.0
+0013 | 20:41:01.683 | ANALYZER.next | bar start time = 20:40
+--------------------------------------------------
+0001 | 20:42:00.863 | IND(SMA).next | SMA period=10 | bar start time = 20:41 | sma=298.842000
+0002 | 20:42:00.863 | IND(SMA).next | SMA period=20 | bar start time = 20:41 | sma=298.829500
+0003 | 20:42:00.865 | STRATEGY.notify_cashvalue cash=599394.04 value=597.70
+0004 | 20:42:00.865 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 20:41:00, 298.85, 298.85, 298.85, 298.85, 409.0; buysig = 0.0
+0005 | 20:42:00.865 | ANALYZER.next | bar start time = 20:41
+
+
+
+
+0001 | 21:20:03.080 | IND(SMA).next | SMA period=10 | bar start time = 21:19 | sma=299.050000
+0002 | 21:20:03.080 | IND(SMA).next | SMA period=20 | bar start time = 21:19 | sma=299.051000
+0003 | 21:20:03.082 | STRATEGY.notify_cashvalue cash=599394.04 value=598.08
+0004 | 21:20:03.082 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 21:19:00, 299.05, 299.07, 299.04, 299.04, 1545.0; buysig = -1.0
+0005 | 21:20:03.084 | ANALYZER.next | bar start time = 21:19
+--------------------------------------------------
+0001 | 21:20:03.095 | STRATEGY.notify_order status=Submitted ref=2
+0002 | 21:20:03.095 | ANALYZER.notify_order status=Submitted ref=2
+0003 | 21:20:03.189 | STRATEGY.notify_order status=Accepted ref=2
+0004 | 21:20:03.189 | ANALYZER.notify_order status=Accepted ref=2
+11-01-26 21:20:04 - trace_metods_last.py - notify_order - 140 - Ордер на продажу 2 бумаг QJSIM.SBER выполнен по цене 299.04 за бумагу. Новая позиция по инструменту: 0
+0005 | 21:20:04.180 | STRATEGY.notify_order status=Completed ref=2
+0006 | 21:20:04.180 | ANALYZER.notify_order status=Completed ref=2
+0007 | 21:20:04.180 | STRATEGY.notify_trade pnl=0.34
+0008 | 21:20:04.180 | ANALYZER.notify_trade pnl=0.34
+0009 | 21:21:01.533 | IND(SMA).next | SMA period=10 | bar start time = 21:20 | sma=299.048000
+0010 | 21:21:01.533 | IND(SMA).next | SMA period=20 | bar start time = 21:20 | sma=299.053000
+0011 | 21:21:01.534 | STRATEGY.notify_cashvalue cash=599991.99 value=598.08
+0012 | 21:21:01.534 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 21:20:00, 299.06, 299.08, 299.04, 299.08, 10693.0; buysig = 0.0
+0013 | 21:21:01.534 | ANALYZER.next | bar start time = 21:20
+--------------------------------------------------
+0001 | 21:22:00.781 | IND(SMA).next | SMA period=10 | bar start time = 21:21 | sma=299.046000
+0002 | 21:22:00.781 | IND(SMA).next | SMA period=20 | bar start time = 21:21 | sma=299.055500
+0003 | 21:22:00.783 | STRATEGY.notify_cashvalue cash=599991.99 value=598.08
+0004 | 21:22:00.783 | STRATEGY.next D-T-O-H-L-C-V: 2026-01-11 21:21:00, 299.08, 299.08, 299.07, 299.07, 1363.0; buysig = 0.0
+0005 | 21:22:00.783 | ANALYZER.next | bar start time = 21:21
+
+
+
+
+
+
+
+--------------------------------------------------
+0001 | 21:47:12.465 | IND(SMA).next | SMA period=10 | bar start time = 21:46 | sma=298.882000
+0002 | 21:47:12.466 | IND(SMA).next | SMA period=20 | bar start time = 21:46 | sma=298.873000
+0003 | 21:47:12.467 | STRATEGY.notify_cashvalue cash=599991.99 value=0.00
+0004 | 21:47:12.467 | STRATEGY.next | bar start time = 21:46 | O-H-L-C-V: 298.97, 298.99, 298.97, 298.99, 1695.0 | buysig = 1.0
+0005 | 21:47:12.469 | ANALYZER.next | bar start time = 21:46
+--------------------------------------------------
+11-01-26 21:48:04 - trace_metods_last.py - notify_order - 140 - Ордер на покупку 2 бумаг QJSIM.SBER выполнен по цене 298.99 за бумагу. Новая позиция по инструменту: 2
+0001 | 21:48:04.186 | IND(SMA).next | SMA period=10 | bar start time = 21:47 | sma=298.898000
+0002 | 21:48:04.186 | IND(SMA).next | SMA period=20 | bar start time = 21:47 | sma=298.877000
+0003 | 21:48:04.186 | STRATEGY.notify_order status=Submitted ref=1
+0004 | 21:48:04.186 | ANALYZER.notify_order status=Submitted ref=1
+0005 | 21:48:04.186 | STRATEGY.notify_order status=Accepted ref=1
+0006 | 21:48:04.186 | ANALYZER.notify_order status=Accepted ref=1
+0007 | 21:48:04.186 | STRATEGY.notify_order status=Completed ref=1
+0008 | 21:48:04.186 | ANALYZER.notify_order status=Completed ref=1
+0009 | 21:48:04.186 | STRATEGY.notify_trade pnl=0.00
+0010 | 21:48:04.186 | ANALYZER.notify_trade pnl=0.00
+0011 | 21:48:04.187 | STRATEGY.notify_cashvalue cash=599393.88 value=597.98
+0012 | 21:48:04.187 | STRATEGY.next | bar start time = 21:47 | O-H-L-C-V: 298.99, 298.99, 298.99, 298.99, 1726.0 | buysig = 0.0
+0013 | 21:48:04.187 | ANALYZER.next | bar start time = 21:47
+--------------------------------------------------
+
+
+
+
+--------------------------------------------------
+0001 | 22:02:01.130 | IND(SMA).next | SMA period=10 | bar start time = 22:01 | sma=298.943000
+0002 | 22:02:01.130 | IND(SMA).next | SMA period=20 | bar start time = 22:01 | sma=298.950000
+0003 | 22:02:01.131 | STRATEGY.notify_cashvalue cash=599393.88 value=597.70
+0004 | 22:02:01.131 | STRATEGY.next | bar start time = 22:01 | O-H-L-C-V: 298.89, 298.91, 298.83, 298.87, 2032.0 | buysig = -1.0
+0005 | 22:02:01.133 | ANALYZER.next | bar start time = 22:01
+--------------------------------------------------
+11-01-26 22:03:04 - trace_metods_last.py - notify_order - 140 - Ордер на продажу 2 бумаг QJSIM.SBER выполнен по цене 298.84000000000003 за бумагу. Новая позиция по инструменту: 0
+0001 | 22:03:04.598 | IND(SMA).next | SMA period=10 | bar start time = 22:02 | sma=298.930000
+0002 | 22:03:04.598 | IND(SMA).next | SMA period=20 | bar start time = 22:02 | sma=298.948500
+0003 | 22:03:04.598 | STRATEGY.notify_order status=Submitted ref=2
+0004 | 22:03:04.598 | ANALYZER.notify_order status=Submitted ref=2
+0005 | 22:03:04.598 | STRATEGY.notify_order status=Accepted ref=2
+0006 | 22:03:04.598 | ANALYZER.notify_order status=Accepted ref=2
+0007 | 22:03:04.598 | STRATEGY.notify_order status=Completed ref=2
+0008 | 22:03:04.598 | ANALYZER.notify_order status=Completed ref=2
+0009 | 22:03:04.598 | STRATEGY.notify_trade pnl=-0.30
+0010 | 22:03:04.598 | ANALYZER.notify_trade pnl=-0.30
+0011 | 22:03:04.599 | STRATEGY.notify_cashvalue cash=599991.44 value=597.70
+0012 | 22:03:04.599 | STRATEGY.next | bar start time = 22:02 | O-H-L-C-V: 298.85, 298.85, 298.81, 298.84, 1904.0 | buysig = 0.0
+0013 | 22:03:04.599 | ANALYZER.next | bar start time = 22:02
+--------------------------------------------------
+0001 | 22:04:01.999 | IND(SMA).next | SMA period=10 | bar start time = 22:03 | sma=298.919000
+0002 | 22:04:01.999 | IND(SMA).next | SMA period=20 | bar start time = 22:03 | sma=298.945500
+0003 | 22:04:02.000 | STRATEGY.notify_cashvalue cash=599991.44 value=597.70
+0004 | 22:04:02.000 | STRATEGY.next | bar start time = 22:03 | O-H-L-C-V: 298.84, 298.87, 298.81, 298.84, 1960.0 | buysig = 0.0
+0005 | 22:04:02.000 | ANALYZER.next | bar start time = 22:03
+--------------------------------------------------
+
+
