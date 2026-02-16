@@ -9,10 +9,10 @@ import datetime
 # Создаем Стратегию
 class TestStrategy(bt.Strategy):
 
-    def log(self, txt, dt=None):
+    def log(self, txt):
         # Функция логирования событий Стратегии
-        dt = dt or self.data.datetime.date(0)
-        print(f'{dt.isoformat()}, {txt}')
+        dt = self.data.datetime.date(0).isoformat()
+        print(f'{dt}, {txt}')
 
     def next(self):
         # Просто выводим цену закрытия каждого дня
@@ -59,4 +59,5 @@ if __name__ == '__main__':
     print(f'Стартовый капитал: {cerebro.broker.getvalue()}')
     cerebro.run()
     cerebro.plot()
+    # cerebro.plot(iplot=False)
     print(f'Финальный капитал: {cerebro.broker.getvalue()}')
