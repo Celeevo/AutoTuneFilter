@@ -2,44 +2,44 @@ from datetime import datetime, timedelta
 import backtrader as bt
 from BacktraderQuikJunior.QJStore import QKStore
 
-# Создаем Стратегию
+# Стратегия - выводим на каждом Баре сообщение о его приходе
 class TestStrategy(bt.Strategy):
     def __init__(self):
-        print(f"STRATEGY.__init__ | Start CASH = {self.broker.getcash()}")
+        print(f"STRATEGY.__init__ - Ожидаем получение нового БАРА из QUIK!")
 
     def next(self):
         # Просто выводим цену закрытия каждого дня
-        print(f"Bar Start DateTime {self.data.datetime.datetime(0).isoformat()}, "
-              f"Real World DateTime {datetime.now().strftime('%H:%M:%S.%f')[:-3]}, "
-              f"Close: {self.data.close[0]}, "
-              f"Previous Close {self.data.close[-1]}")
+        print(f"{50*'*'}\n"
+              f"ПОЛУЧЕН НОВЫЙ БАР (Time: {datetime.now().strftime('%H:%M:%S')})!\n"
+              f"Data Feed LEN: {len(self.data)}\n"
+              f"Bar Start Time {self.data.datetime.datetime(0).time().isoformat()}\n"
+              f"Close[0]: {self.data.close[0]}")
+        if len(self.data) > 1:
+            for i in range(1, len(self.data)):
+                print(f"Close[-{i}]: {self.data.close[-i]}")
 
 def main():
     # Создаем экземпляры cerebro и хранилища
     cerebro = bt.Cerebro(stdstats=False, quicknotify=True)
-    # cerebro = bt.Cerebro(stdstats=False)
     store = QKStore()
 
     dataname = 'QJSIM.SBER'
-
 
     broker = store.getbroker()  # экземпляр брокера берем из хранилища
     cerebro.setbroker(broker)  # привязываем его к cerebro
     # Проверяем запрошенный источник данных на его наличие в QUIK Junior
     broker.check_data_names(dataname)
 
-    fromdate = datetime.today().date()  # с какой даты берем данные
-    fromdate = datetime.today() - timedelta(minutes=1)
-    # fromdate = datetime.now()  # с какой даты берем данные
+    fromdate = datetime.today() - timedelta(minutes=2)
+    print(datetime.today(), fromdate)
     # Будем работать на тайм-фрейме 1 минута
     data = store.getdata(dataname=dataname, timeframe=bt.TimeFrame.Minutes,
-                         compression=1, fromdate=fromdate, live_bars=True)
+                         compression=1,
+                         fromdate=fromdate,
+                         live_bars=True)
 
-    # Добавляем в cerebro источник данных, сайзер, стратегию и
-    # запускаем движок
     cerebro.adddata(data)
     cerebro.addstrategy(TestStrategy)
-    # cerebro.addstrategy(TraceStrat)
     cerebro.run()
 
 if __name__ == '__main__':
