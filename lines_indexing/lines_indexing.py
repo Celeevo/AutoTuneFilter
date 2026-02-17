@@ -28,7 +28,7 @@ def main():
     broker = store.getbroker()  # экземпляр брокера берем из хранилища
     cerebro.setbroker(broker)  # привязываем его к cerebro
     # Проверяем запрошенный источник данных на его наличие в QUIK Junior
-    broker.check_data_names(dataname)
+    # broker.check_data_names(dataname)
 
     fromdate = datetime.today() - timedelta(minutes=2)
     print(datetime.today(), fromdate)
