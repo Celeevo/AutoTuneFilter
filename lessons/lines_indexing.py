@@ -11,8 +11,8 @@ class TestStrategy(bt.Strategy):
     def next(self):
         print(f"{50 * '*'}\n"
             f"ПОЛУЧЕН НОВЫЙ БАР (Time: {datetime.now().strftime('%H:%M:%S')})!\n"
+            f"Bar Start at {bt.num2time(self.data.datetime[0])}\n"
             f"Data Feed LEN: {len(self.data)}\n"
-            f"Bar Start Time {self.data.datetime.datetime(0).time().isoformat()}\n"
             f"Close[0]: {self.data.close[0]}")
         for i in range(1, len(self.data)):
             print(f"Close[-{i}]: {self.data.close[-i]}")

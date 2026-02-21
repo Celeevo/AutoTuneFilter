@@ -12,7 +12,9 @@ class TestStrategy(bt.Strategy):
         print(f"{50*'*'}\n"
               f"ПОЛУЧЕН НОВЫЙ БАР (Time: {datetime.now().strftime('%H:%M:%S')})!\n"
               f"Data Feed LEN: {len(self.data)}\n"
-              f"Bar Start Time {self.data.datetime.datetime(0).time().isoformat()}\n"
+              f"Bar Start at {bt.num2date(self.data.datetime[0])}\n"
+              # f"Bar Start Time {bt.num2date(self.data.datetime[0]).time()}\n"
+              # f"Bar Start Time {self.data.datetime.datetime(0).time().isoformat()}\n"
               f"Close[0]: {self.data.close[0]}")
         if len(self.data) > 1:
             for i in range(1, len(self.data)):
