@@ -9,20 +9,22 @@ class TestStrategy(bt.Strategy):
               f"Ожидаем получение нового БАРА из QUIK!")
 
     def next(self):
-        print(f"{50 * '*'}\n"
-            f"ПОЛУЧЕН НОВЫЙ БАР (Time: {datetime.now().strftime('%H:%M:%S')})!\n"
-            f"Bar Start at {bt.num2time(self.data.datetime[0])}\n"
-            f"Data Feed LEN: {len(self.data)}\n"
-            f"Close[0]: {self.data.close[0]}")
-        for i in range(1, len(self.data)):
-            print(f"Close[-{i}]: {self.data.close[-i]}")
+        print(f"\n{50*'*'}\n"
+              f"ПОЛУЧЕН НОВЫЙ БАР! "
+              f"(Time: {datetime.now().strftime('%H:%M:%S')}, "
+              f"Data Feed LEN: {len(self.data)})\n"
+              f"Bar Start Time: {bt.num2time(self.data.datetime[0])}, "
+              f"Close[0]: {self.data.close[0]}")
+        if len(self.data) > 1:
+            print(f"ПРЕДЫДУЩИЕ БАРЫ:")
+            for i in range(1, len(self.data)):
+                print(f"Bar Start Time: {bt.num2time(self.data.datetime[-i])}, "
+                      f"Close[-{i}]: {self.data.close[-i]}")
 
 def main():
-    # Создаем экземпляры cerebro, хранилища store и брокера
-    cerebro = bt.Cerebro(stdstats=False, quicknotify=True)
+    # Создаем экземпляры cerebro и хранилища store
+    cerebro = bt.Cerebro()
     store = QKStore()
-    broker = store.getbroker()  # экземпляр брокера берем из хранилища
-    cerebro.setbroker(broker)  # привязываем его к cerebro
 
     # Создаем Источник данных и добавляем его в cerebro
     dataname = 'QJSIM.SBER'
