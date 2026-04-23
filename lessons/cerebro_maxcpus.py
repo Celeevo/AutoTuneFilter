@@ -35,25 +35,23 @@ class OneLinePerRunStrategy(bt.Strategy):
         )
 
 
-def make_data(nbars=5):
-    df = pd.DataFrame({
-        'open':   list(range(100, 100 + nbars)),
-        'high':   list(range(101, 101 + nbars)),
-        'low':    list(range(99, 99 + nbars)),
-        'close':  list(range(100, 100 + nbars)),
-        'volume': [1000] * nbars,
-    }, index=pd.date_range('1917-01-01', periods=nbars, freq='D'))
-
-    return bt.feeds.PandasData(dataname=df)
-
-
 def run_case(maxcpus_value):
     print('=' * 90)
     print(f'ЗАПУСК: maxcpus={maxcpus_value}')
     print('=' * 90, flush=True)
 
     cerebro = bt.Cerebro()
-    cerebro.adddata(make_data())
+
+    df = pd.DataFrame({
+        'open':   range(100, 105),
+        'high':   range(101, 106),
+        'low':    range(99, 104),
+        'close':  range(102, 107),
+        'volume': range(1000, 1005),
+    }, index=pd.date_range('1917-01-01', periods=5, freq='D'))
+
+    data = bt.feeds.PandasData(dataname=df)
+    cerebro.adddata(data)
 
     # Несколько вариантов стратегии
     cerebro.optstrategy(

@@ -3,13 +3,10 @@ import pandas as pd
 
 
 class OptResultDemoStrategy(bt.Strategy):
-    params = (
-        ('period', 2),
-    )
+    params = dict(period=0)
 
     def next(self):
         # Логика здесь не важна.
-        # Нам нужен именно результат optstrategy/run().
         pass
 
 
@@ -17,6 +14,8 @@ def run_demo(optreturn_value):
     print('=' * 60)
     print(f'Запуск с optreturn={optreturn_value}')
     print('=' * 60)
+
+    cerebro = bt.Cerebro()
 
     df = pd.DataFrame({
         'open':   range(100, 105),
@@ -27,17 +26,12 @@ def run_demo(optreturn_value):
     }, index=pd.date_range('1917-01-01', periods=5, freq='D'))
 
     data = bt.feeds.PandasData(dataname=df)
-
-    cerebro = bt.Cerebro()
     cerebro.adddata(data)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
 
     # Оптимизируем один параметр по трём значениям
     cerebro.optstrategy(OptResultDemoStrategy, period=[2, 3, 4])
-
-    # maxcpus=1 нужен только для учебной ясности,
-    # чтобы порядок вывода был предсказуемым
-    results = cerebro.run(maxcpus=1, optreturn=optreturn_value)
+    results = cerebro.run(optreturn=optreturn_value)
 
     print(f'Тип results: {type(results)}')
     print(f'Длина results: {len(results)}')
