@@ -153,48 +153,56 @@ class AllInSizer(bt.Sizer):
 
 class ATRRiskSizer(bt.Sizer):
     """
-    Считает размер позиции по риску от депозита и расстоянию до стопа.
+        Размер позиции для фьючерсов:
+        - по риску до ATR-стопа
+        - с учётом ограничения по ГО
 
-    Стратегия должна ДО вызова buy()/sell() записать:
-    - self._risk_entry_price
-    - self._risk_stop_price
+        Стратегия ДО buy()/sell() должна записать:
+        - self.entry_price
+        - self.stop_loss_price
 
-    Формула:
-        risk_cash = portfolio_value * risk_percent
-        size = risk_cash / (abs(entry_price - stop_price) * contract_mult)
-    """
+        Логика:
+            size_by_risk  = risk_cash / (stop_dist * mult)
+            size_by_go    = cash / margin
+            size          = min(size_by_risk, size_by_go)
 
-    params = (
-        ('risk_percent', 0.01),   # 1% риска на сделку
-        ('contract_mult', 1.0),   # денежная стоимость 1 пункта на 1 контракт
-        ('min_size', 1),
-        ('retint', True),
-    )
+        Где:
+        - mult   = денежная стоимость 1 пункта движения на 1 контракт
+        - margin = ГО на 1 контракт
+        """
 
     def _getsizing(self, comminfo, cash, data, isbuy):
-        entry_price = getattr(self.strategy, '_risk_entry_price', None)
-        stop_price = getattr(self.strategy, '_risk_stop_price', None)
+        entry_price = getattr(self.strategy, 'entry_price', None)
+        stop_loss_price = getattr(self.strategy, 'stop_loss_price', None)
 
-        if entry_price is None or stop_price is None:
+        if entry_price is None or stop_loss_price is None:
             return 0
 
-        stop_dist = abs(entry_price - stop_price)
+        stop_dist = abs(entry_price - stop_loss_price)
         if stop_dist <= 0:
             return 0
 
-        portfolio_value = self.broker.getvalue()
-        risk_cash = portfolio_value * self.p.risk_percent
+        # Риск в деньгах — как у тебя раньше: % от текущего cash
+        risk_cash = cash * (self.strategy.p.risk / 100)
 
-        risk_per_unit = stop_dist * self.p.contract_mult
-        if risk_per_unit <= 0:
+        # Денежный риск на 1 контракт
+        risk_per_contract = stop_dist * comminfo.p.mult
+        if risk_per_contract <= 0:
             return 0
 
-        size = risk_cash / risk_per_unit
+        # Размер по риску
+        size_by_risk = risk_cash / risk_per_contract
 
-        if self.p.retint:
-            size = math.floor(size)
+        # Размер по ГО
+        if comminfo.p.margin:
+            size_by_go = cash / comminfo.p.margin
+        else:
+            size_by_go = cash / entry_price
 
-        if size < self.p.min_size:
+        # Как и в твоём AllInSizer, оставим запас в 1 контракт
+        size = int(min(size_by_risk, size_by_go)) - 1
+
+        if size <= 0:
             return 0
 
         return size
@@ -449,9 +457,11 @@ class AutoTuneFilterStrategy(bt.Strategy):
         end_date=None,
         window=26,
         bandwidth=0.22,
-        thresh=0.22,
+        thresh=-0.22,
         allow_short=True,
         printlog=False,
+        atr_period=14,
+        atr_mult=2,
     )
 
     def log(self, txt):
@@ -465,10 +475,14 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
+        self.atr = bt.indicators.AverageTrueRange(
+            self.data,
+            period=self.p.atr_period
+        )
         self.stop_loss_price, self.entry_price = 0.0, 0.0
 
         # ROC из статьи: BP - BP[2]
-        self.roc = self.atf.bp - self.atf.bp(-4)
+        self.roc = self.atf.bp - self.atf.bp(-2)
 
         # Сигналы пересечения нуля
         self.cross_up = bt.indicators.CrossUp(self.roc, 0.0)
@@ -488,7 +502,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
                     size=order.executed.size,
                     price=self.stop_loss_price,
                     name='stop_loss',
-                    # oco=self.take_profit
                 )
                 if order.isbuy():
                     self.log(f'BUY EXECUTED at {order.executed.price:.2f}')
@@ -530,11 +543,13 @@ class AutoTuneFilterStrategy(bt.Strategy):
             if long_signal:
                 self.log('LONG SIGNAL -> buy()')
                 self.entry_price = self.data.close[0]
+                # self.stop_loss_price = self.entry_price - self.p.atr_mult * self.atr[0]
                 self.order = self.buy(name='long')
 
             elif self.p.allow_short and short_signal:
                 self.log('SHORT SIGNAL -> sell()')
                 self.entry_price = self.data.close[0]
+                # self.stop_loss_price = self.entry_price - self.p.atr_mult * self.atr[0]
                 self.order = self.sell(name='short')
 
             return
@@ -545,21 +560,41 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 if self.p.allow_short:
                     self.log('EXIT FROM LONG')
                     self.close()
+                    self.cancel(self.stop_order)
                     self.stop_order = None
-                    self.entry_price = self.data.close[0]
-                    self.order = self.sell(name='short')
+                    # self.entry_price = self.data.close[0]
+                    # self.stop_loss_price = self.entry_price + self.p.atr_mult * self.atr[0]
+                    # comminfo = self.broker.getcommissioninfo(self.data)
+                    # if comminfo.p.cost_of_price_step != 0:
+                    #     self.stop_loss_price = round_to_nearest_price_step(
+                    #         comminfo.p.cost_of_price_step,
+                    #         self.stop_loss_price,
+                    #         True
+                    #     )
+                    # self.order = self.sell(name='short')
                 else:
                     self.log('EXIT FROM LONG')
                     self.order = self.close()
+                    self.cancel(self.stop_order)
+                    self.stop_order = None
             return
 
         # Уже short
         if self.position.size < 0 and long_signal:
             self.log('EXIT FROM SHORT')
             self.close()
+            self.cancel(self.stop_order)
             self.stop_order = None
-            self.entry_price = self.data.close[0]
-            self.order = self.buy(name='long')
+            # self.entry_price = self.data.close[0]
+            # self.stop_loss_price = self.entry_price + self.p.atr_mult * self.atr[0]
+            # comminfo = self.broker.getcommissioninfo(self.data)
+            # if comminfo.p.cost_of_price_step != 0:
+            #     self.stop_loss_price = round_to_nearest_price_step(
+            #         comminfo.p.cost_of_price_step,
+            #         self.stop_loss_price,
+            #         True
+            #     )
+            # self.order = self.buy(name='long')
 
 
 def main(maxcpus=None):
@@ -570,19 +605,20 @@ def main(maxcpus=None):
         write_history=True,
         depo=300000.0,  # Начальный депозит
         risk=5,
-        window=30, # range(27,33),  #26,
-        # bandwidth=[0.1, 0.14, 0.18, 0.22, 0.26, 0.3], # 0.22,
-        # thresh=[0.1, 0.14, 0.18, 0.22, 0.26, 0.3], # 0.22, #
-        bandwidth=[i / 100 for i in range(1, 31)], # [0.08, 0.16, 0.24, 0.32, 0.4]
-        thresh=[i / 12.5 for i in range(1, 6)], # 0.22, #
+        window=range(16,61,2),  #30,
+        bandwidth=0.22, #[0.08, 0.16, 0.24, 0.32, 0.4], # [i / 100 for i in range(1, 31)]
+        thresh=[-i / 12.5 for i in range(1, 6)], # 0.22, #
+        # atr_period=range(10,19,2),
+        # atr_mult=[1.5, 1.75, 2, 2.25, 2.5],
         allow_short=True,
         printlog=False,
-
     )
 
 
+    # tf = params['tf'] = '15m'
     # tf = params['tf'] = '30m'
     tf = params['tf'] = '1h'
+    # tf = params['tf'] = '1d'
     start_date = params['start_date'] = '2025-3-20'  # datetime.today() - timedelta(days=365)
 
     end_date = params['end_date'] = '2026-3-17'  # datetime.today()
@@ -652,6 +688,7 @@ def main(maxcpus=None):
         cerebro.broker.setcash(params['depo'])
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
         cerebro.addsizer(AllInSizer)
+        # cerebro.addsizer(ATRRiskSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **aparams)
         cerebro.adddata(data)
 

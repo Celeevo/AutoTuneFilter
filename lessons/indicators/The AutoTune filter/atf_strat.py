@@ -12,12 +12,18 @@ class AutoTuneFilterStrategy(bt.Strategy):
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
     """
 
-    params = (
-        ('window', 26),
-        ('bandwidth', 0.22),
-        ('thresh', -0.22),
-        ('allow_short', True),
-        ('printlog', True),
+    params = dict(
+        write_history=None,  # Записываем или нет детальную инфу о каждой сделке
+        depo=0,  # Начальный депозит
+        tf=None,
+        risk=None,
+        start_date=None,
+        end_date=None,
+        window=26,
+        bandwidth=0.22,
+        thresh=0.22,
+        allow_short=True,
+        printlog=False,
     )
 
     def log(self, txt):
@@ -31,6 +37,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
+        self.stop_loss_price, self.entry_price = 0.0, 0.0
 
         # ROC из статьи: BP - BP[2]
         self.roc = self.atf.bp - self.atf.bp(-2)
@@ -83,32 +90,40 @@ class AutoTuneFilterStrategy(bt.Strategy):
         if not self.position:
             if long_signal:
                 self.log('LONG SIGNAL -> buy()')
+                self.entry_price = self.data.close[0]
                 self.order = self.buy()
 
             elif self.p.allow_short and short_signal:
                 self.log('SHORT SIGNAL -> sell()')
+                self.entry_price = self.data.close[0]
                 self.order = self.sell()
 
             return
 
         # Уже long
         if self.position.size > 0:
-            if self.p.allow_short and short_signal:
-                self.log('REVERSE LONG -> SHORT')
-                self.close()
-                self.order = self.sell()
+            if short_signal:
+                if self.p.allow_short:
+                    # self.log('REVERSE LONG -> SHORT')
+                    self.log('EXIT')
+                    self.close()
+                    # self.order = self.sell()
+                else:
+                    self.log('EXIT LONG')
+                    # self.order = self.close()
+            return
 
         # Уже short
-        elif self.position.size < 0:
-            if long_signal:
-                self.log('REVERSE SHORT -> LONG')
-                self.close()
-                self.order = self.buy()
+        if self.position.size < 0 and long_signal:
+            # self.log('REVERSE SHORT -> LONG')
+            self.log('EXIT')
+            self.close()
+            # self.order = self.buy()
 
 
 if __name__ == '__main__':
     cerebro = bt.Cerebro(stdstats=True)
-    cerebro.broker.setcash(300_000)
+    cerebro.broker.setcash(1000000)
 
     store = MoexStore(write_to_file=True, read_from_file=True)
 
@@ -123,7 +138,7 @@ if __name__ == '__main__':
     cerebro.adddata(data)
 
     # Можно поставить size через sizer
-    cerebro.addsizer(bt.sizers.FixedSize, stake=5)
+    cerebro.addsizer(bt.sizers.FixedSize, stake=1)
 
     cerebro.addstrategy(
         AutoTuneFilterStrategy,
