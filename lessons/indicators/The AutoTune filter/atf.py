@@ -27,10 +27,10 @@ class AutoTuneFilter(bt.Indicator):
     plotinfo = dict(subplot=True)
 
     plotlines = dict(
-        bp=dict(_name='AutoTune BP'),
-        filt=dict(_name='HighPass', _plotskip=True),
-        mincorr=dict(_name='MinCorr'),
-        dc=dict(_name='DominantCycle'),
+        bp=dict(_name='AutoTune BP', _plotskip=True),
+        filt=dict(_name='HighPass'),
+        mincorr=dict(_name='MinCorr', _plotskip=True),
+        dc=dict(_name='DominantCycle', _plotskip=True),
     )
 
     def _nz(self, value, default=0.0):

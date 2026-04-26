@@ -460,8 +460,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
         thresh=-0.22,
         allow_short=True,
         printlog=False,
-        atr_period=14,
-        atr_mult=2,
+        tp_mult=2.0,   # тейк-профит в R
     )
 
     def log(self, txt):
@@ -475,11 +474,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
-        self.atr = bt.indicators.AverageTrueRange(
-            self.data,
-            period=self.p.atr_period
-        )
+
+        # self.ema = bt.indicators.EMA(self.data, period=40)
+        # self.rsi = bt.indicators.RSI(self.data, period=14)
+
         self.stop_loss_price, self.entry_price = 0.0, 0.0
+        self.take_profit_price = 0.0
 
         # ROC из статьи: BP - BP[2]
         self.roc = self.atf.bp - self.atf.bp(-2)
@@ -490,6 +490,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
         self.order = None
         self.stop_order = None
+        self.take_profit_order = None
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
@@ -497,21 +498,97 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
         if order.status == order.Completed:
             if order.info.name in ('long', 'short'):
-                stop_loss_params = dict(
-                    exectype=bt.Order.Stop,
-                    size=order.executed.size,
-                    price=self.stop_loss_price,
-                    name='stop_loss',
-                )
+                exit_size = abs(order.executed.size)
+                executed_entry = order.executed.price
+                risk_points = abs(executed_entry - self.stop_loss_price)
+
+                comminfo = self.broker.getcommissioninfo(self.data)
+
                 if order.isbuy():
-                    self.log(f'BUY EXECUTED at {order.executed.price:.2f}')
-                    self.stop_order = self.sell(**stop_loss_params)
+                    self.log(f'BUY EXECUTED at {executed_entry:.2f}')
+
+                    raw_take_profit = executed_entry + self.p.tp_mult * risk_points
+                    if comminfo.p.cost_of_price_step != 0:
+                        # тейк для long округляем К ВХОДУ, т.е. вниз
+                        self.take_profit_price = round_to_nearest_price_step(
+                            comminfo.p.cost_of_price_step,
+                            raw_take_profit,
+                            True
+                        )
+                    else:
+                        self.take_profit_price = raw_take_profit
+
+                    self.stop_order = self.sell(
+                        exectype=bt.Order.Stop,
+                        size=exit_size,
+                        price=self.stop_loss_price,
+                        name='stop_loss'
+                    )
+                    self.take_profit_order = self.sell(
+                        exectype=bt.Order.Limit,
+                        size=exit_size,
+                        price=self.take_profit_price,
+                        name='take_profit',
+                        oco=self.stop_order
+                    )
+
                 else:
-                    self.log(f'SELL EXECUTED at {order.executed.price:.2f}')
-                    self.stop_order = self.buy(**stop_loss_params)
+                    self.log(f'SELL EXECUTED at {executed_entry:.2f}')
+
+                    raw_take_profit = executed_entry - self.p.tp_mult * risk_points
+                    if comminfo.p.cost_of_price_step != 0:
+                        # тейк для short округляем К ВХОДУ, т.е. вверх
+                        self.take_profit_price = round_to_nearest_price_step(
+                            comminfo.p.cost_of_price_step,
+                            raw_take_profit,
+                            False
+                        )
+                    else:
+                        self.take_profit_price = raw_take_profit
+
+                    self.stop_order = self.buy(
+                        exectype=bt.Order.Stop,
+                        size=exit_size,
+                        price=self.stop_loss_price,
+                        name='stop_loss'
+                    )
+                    self.take_profit_order = self.buy(
+                        exectype=bt.Order.Limit,
+                        size=exit_size,
+                        price=self.take_profit_price,
+                        name='take_profit',
+                        oco=self.stop_order
+                    )
+
+                self.log(
+                    f'STOP={self.stop_loss_price:.2f} | '
+                    f'TP(2R)={self.take_profit_price:.2f}'
+                )
+
+            # ---------- исполнился stop-loss ----------
+            elif order.info.name == 'stop_loss':
+                self.log(f'STOP LOSS EXECUTED at {order.executed.price:.2f}')
+                self.stop_order = None
+                self.take_profit_order = None
+                self.stop_loss_price = 0.0
+                self.take_profit_price = 0.0
+                self.entry_price = 0.0
+
+            # ---------- исполнился take-profit ----------
+            elif order.info.name == 'take_profit':
+                self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
+                self.take_profit_order = None
+                self.stop_order = None
+                self.stop_loss_price = 0.0
+                self.take_profit_price = 0.0
+                self.entry_price = 0.0
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'ORDER FAILED: {order.getstatusname()}')
+            if order == self.stop_order:
+                self.stop_order = None
+            elif order == self.take_profit_order:
+                self.take_profit_order = None
 
         self.order = None
 
@@ -543,75 +620,40 @@ class AutoTuneFilterStrategy(bt.Strategy):
             if long_signal:
                 self.log('LONG SIGNAL -> buy()')
                 self.entry_price = self.data.close[0]
-                # self.stop_loss_price = self.entry_price - self.p.atr_mult * self.atr[0]
                 self.order = self.buy(name='long')
 
             elif self.p.allow_short and short_signal:
                 self.log('SHORT SIGNAL -> sell()')
                 self.entry_price = self.data.close[0]
-                # self.stop_loss_price = self.entry_price - self.p.atr_mult * self.atr[0]
                 self.order = self.sell(name='short')
 
             return
 
-        # Уже long
-        if self.position.size > 0:
-            if short_signal:
-                if self.p.allow_short:
-                    self.log('EXIT FROM LONG')
-                    self.close()
-                    self.cancel(self.stop_order)
-                    self.stop_order = None
-                    # self.entry_price = self.data.close[0]
-                    # self.stop_loss_price = self.entry_price + self.p.atr_mult * self.atr[0]
-                    # comminfo = self.broker.getcommissioninfo(self.data)
-                    # if comminfo.p.cost_of_price_step != 0:
-                    #     self.stop_loss_price = round_to_nearest_price_step(
-                    #         comminfo.p.cost_of_price_step,
-                    #         self.stop_loss_price,
-                    #         True
-                    #     )
-                    # self.order = self.sell(name='short')
-                # else:
-                #     self.log('EXIT FROM LONG')
-                #     self.order = self.close()
-                #     self.cancel(self.stop_order)
-                #     self.stop_order = None
+        # Если позиция уже есть, новых действий не делаем.
+        # Выход только по stop-loss или take-profit.
+        if self.position:
             return
 
-        # Уже short
-        if self.position.size < 0 and long_signal:
-            self.log('EXIT FROM SHORT')
-            self.close()
-            self.cancel(self.stop_order)
-            self.stop_order = None
-            # self.entry_price = self.data.close[0]
-            # self.stop_loss_price = self.entry_price + self.p.atr_mult * self.atr[0]
-            # comminfo = self.broker.getcommissioninfo(self.data)
-            # if comminfo.p.cost_of_price_step != 0:
-            #     self.stop_loss_price = round_to_nearest_price_step(
-            #         comminfo.p.cost_of_price_step,
-            #         self.stop_loss_price,
-            #         True
-            #     )
-            # self.order = self.buy(name='long')
+        # Если выходные ордера ещё висят, тоже ничего не делаем
+        if self.stop_order or self.take_profit_order:
+            return
+
 
 
 def main(maxcpus=None):
 
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
-
+    # 26-04-26 50-0.32--0.48-1.5-MIX
     params = dict(
         write_history=True,
         depo=300000.0,  # Начальный депозит
         risk=5,
-        window=49,  #range(16,57),  #30,
-        bandwidth=0.22, #[0.08, 0.16, 0.24, 0.32, 0.4], # [i / 100 for i in range(1, 31)]
-        thresh=-0.42,  #[-i / 12.5 for i in range(3, 8)], # 0.22, #
-        # atr_period=range(10,19,2),
-        # atr_mult=[1.5, 1.75, 2, 2.25, 2.5],
+        window=50,  #range(16,57),  #30,
+        bandwidth=[i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
+        tp_mult=[1+i/10 for i in range(1,7)],   # тейк-профит в R
     )
 
 
@@ -621,7 +663,8 @@ def main(maxcpus=None):
     # tf = params['tf'] = '1d'
     start_date = params['start_date'] = '2025-3-20'  # datetime.today() - timedelta(days=365)
 
-    end_date = params['end_date'] = '2026-3-17'  # datetime.today()
+    # end_date = params['end_date'] = '2026-3-17'  # datetime.today()
+    end_date = params['end_date'] = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
 
     # futures = ['RTS', 'RTSM', 'NASD', 'CNY', 'Eu', 'NG', 'GOLD', 'SBRF']

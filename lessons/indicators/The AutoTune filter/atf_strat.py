@@ -21,7 +21,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
         end_date=None,
         window=26,
         bandwidth=0.22,
-        thresh=0.22,
+        thresh=-0.22,
         allow_short=True,
         printlog=False,
     )
@@ -144,7 +144,7 @@ if __name__ == '__main__':
         AutoTuneFilterStrategy,
         window=26,
         bandwidth=0.22,
-        thresh=-0.22,
+        thresh=-0.42,
         allow_short=True,
         printlog=True
     )
