@@ -572,11 +572,11 @@ class AutoTuneFilterStrategy(bt.Strategy):
                     #         True
                     #     )
                     # self.order = self.sell(name='short')
-                else:
-                    self.log('EXIT FROM LONG')
-                    self.order = self.close()
-                    self.cancel(self.stop_order)
-                    self.stop_order = None
+                # else:
+                #     self.log('EXIT FROM LONG')
+                #     self.order = self.close()
+                #     self.cancel(self.stop_order)
+                #     self.stop_order = None
             return
 
         # Уже short
@@ -605,9 +605,9 @@ def main(maxcpus=None):
         write_history=True,
         depo=300000.0,  # Начальный депозит
         risk=5,
-        window=range(16,61,2),  #30,
+        window=(16,47),  #30,
         bandwidth=0.22, #[0.08, 0.16, 0.24, 0.32, 0.4], # [i / 100 for i in range(1, 31)]
-        thresh=[-i / 12.5 for i in range(1, 6)], # 0.22, #
+        thresh=[-i / 12.5 for i in range(3, 8)], # 0.22, #
         # atr_period=range(10,19,2),
         # atr_mult=[1.5, 1.75, 2, 2.25, 2.5],
         allow_short=True,
