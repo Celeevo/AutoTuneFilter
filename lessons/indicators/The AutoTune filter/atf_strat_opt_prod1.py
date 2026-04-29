@@ -19,14 +19,6 @@ from statistics import mean, stdev
 import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 
-FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
-    currency=0.00462,   # Валютные контракты
-    percent=0.01650,    # Процентные контракты
-    stock=0.01980,      # Фондовые контракты
-    xindex=0.00660,     # Индексные контракты
-    commodity=0.01320   # Товарные контракты
-)
-
 class FuturesCommission(bt.CommInfoBase):
     params = dict(moexcomm=0.0, cost_of_price_step=0)  # Базовая ставка комиссии Биржи
 
@@ -35,77 +27,15 @@ class FuturesCommission(bt.CommInfoBase):
         moexs_pocket = abs(size) * price * self.p.mult * self.p.moexcomm / 100
         return brokers_pocket + moexs_pocket
 
-
-# Класс для расчета комиссии при работе с Акциями
-class StockCommission(bt.CommInfoBase):
-    params = dict(
-        moexcomm=0,  # Комиссии Биржи в % от покупки/продажи (0.03%)
-        brokercomm=0  # Комиссии Брокера в % от покупки/продажи (0.03%)
-    )
-
-    def _getcommission(self, size, price, pseudoexec):
-        return abs(size) * price * (self.p.moexcomm + self.p.brokercomm)
-
-
-futures_comm = dict( # Комиссии для фьючерсов
-    RTS=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=29000, # 27/04/25, 24700,  # ГО 05.12.2024
-                          mult=16.53098/10,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex']),
-    RTSM=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=2900,  # 27/04/25, 2470,  # ГО 05.12.2024
-                          mult=8.26549/0.5,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex']),
-    NASD=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=2607,  # ГО 05.12.2024
-                          mult=0.97966/1,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex']),
-    CNY=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=1050,  # ГО 27/04/25
-                          mult=1/0.001,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
-    Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=15758,  # ГО  05.12.2024
-                          mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
-    Eu=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=16000,  # ГО
-                          mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
-    NG=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=6300,  # ГО
-                          mult=9.8/0.001,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['commodity']),
-    GOLD=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=16600,  # ГО
-                          mult=9.8/0.1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['commodity']),
-    SBRF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5200,  # ГО
-                          mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['stock']),
-    BR=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                         margin=10374,  # ГО 30-12-24
-                         mult=10.167/ 0.01,  # мультипликатор
-                         moexcomm=FUTURE_TYPE['commodity']),
-    MIX=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=33000,  # - ГО 26-04-26
-                          mult=25 / 25,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'],
-                          cost_of_price_step=25),
-    MXI=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=3500,  # - ГО 26-04-25, 3400 - ГО 07.02.2025
-                          mult=0.5 / 0.05,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05),
-    SPYF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5600,  # ГО 27-04-25
-                          mult=0.82655 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05))
+futures_comm = FuturesCommission(commission=2.0,  # 2 руб за контракт
+                                 margin=33000,  # - ГО 26-04-26
+                                 mult=1,  # мультипликатор Стоимость шага цены/Шаг цены
+                                 moexcomm=0.00660,  #ком-я за Индексные контракты
+                                 cost_of_price_step=25)
 
 def round_to_nearest_price_step(step, value, isbuy):
     """
     Универсальное округление до ближайшего кратного шага цены.
-    Работает с любыми положительными step, в т.ч. < 1.
 
     :param step: Шаг цены инструмента (>0)
     :param value: Значение, которое нужно округлить
@@ -116,14 +46,15 @@ def round_to_nearest_price_step(step, value, isbuy):
     if step <= 0:
         raise ValueError('step должен быть > 0')
 
-    # Переводим во "внутреннюю" точку Decimal, чтобы избежать погрешностей float
+    # Переводим в Decimal, чтобы избежать погрешностей float
     step_d  = Decimal(str(step))
     value_d = Decimal(str(value))
 
     # Сколько шагов содержится в price?
     steps_cnt = value_d / step_d
 
-    # Округляем количество шагов
+    # ROUND_FLOOR - округление в меньшую сторону
+    # ROUND_CEILING - округление вверх
     rounding_mode = ROUND_FLOOR if isbuy else ROUND_CEILING
     steps_cnt = steps_cnt.to_integral_value(rounding=rounding_mode)
 
@@ -147,64 +78,6 @@ class AllInSizer(bt.Sizer):
             self.strategy.stop_loss_price = round_to_nearest_price_step(comminfo.p.cost_of_price_step, stop_loss_price, isbuy)
         else:
             self.strategy.stop_loss_price = stop_loss_price
-        # print(f'SIZER: {data.p.name = }, {cash = }, {comminfo.p.margin = }, {comminfo.p.mult = }, {size = }, {self.strategy.entry_price = }, {self.strategy.stop_loss_price = }, {isbuy = }')
-        return size
-
-
-class ATRRiskSizer(bt.Sizer):
-    """
-        Размер позиции для фьючерсов:
-        - по риску до ATR-стопа
-        - с учётом ограничения по ГО
-
-        Стратегия ДО buy()/sell() должна записать:
-        - self.entry_price
-        - self.stop_loss_price
-
-        Логика:
-            size_by_risk  = risk_cash / (stop_dist * mult)
-            size_by_go    = cash / margin
-            size          = min(size_by_risk, size_by_go)
-
-        Где:
-        - mult   = денежная стоимость 1 пункта движения на 1 контракт
-        - margin = ГО на 1 контракт
-        """
-
-    def _getsizing(self, comminfo, cash, data, isbuy):
-        entry_price = getattr(self.strategy, 'entry_price', None)
-        stop_loss_price = getattr(self.strategy, 'stop_loss_price', None)
-
-        if entry_price is None or stop_loss_price is None:
-            return 0
-
-        stop_dist = abs(entry_price - stop_loss_price)
-        if stop_dist <= 0:
-            return 0
-
-        # Риск в деньгах — как у тебя раньше: % от текущего cash
-        risk_cash = cash * (self.strategy.p.risk / 100)
-
-        # Денежный риск на 1 контракт
-        risk_per_contract = stop_dist * comminfo.p.mult
-        if risk_per_contract <= 0:
-            return 0
-
-        # Размер по риску
-        size_by_risk = risk_cash / risk_per_contract
-
-        # Размер по ГО
-        if comminfo.p.margin:
-            size_by_go = cash / comminfo.p.margin
-        else:
-            size_by_go = cash / entry_price
-
-        # Как и в твоём AllInSizer, оставим запас в 1 контракт
-        size = int(min(size_by_risk, size_by_go)) - 1
-
-        if size <= 0:
-            return 0
-
         return size
 
 def iterable_params(p:dict):
@@ -358,10 +231,6 @@ class SmartAnalyzer(Analyzer):
                 trade.finish_cash = self.strategy.broker.getcash()
                 trade.stop_loss_price = self.strategy.stop_loss_price
                 trade.sec_id = trade.getdataname()
-                # Был ли источник склеен с помощью rollover?
-                # Если да, добавляем имена склеенных источников
-                # if hasattr(trade.data, '_d'):
-                #     trade.sec_id += '-' + trade.data._d._name
                 self.trades.append(trade)
                 self.depos = self.strategy.broker.getcash()
 
@@ -369,7 +238,7 @@ class SmartAnalyzer(Analyzer):
         '''
         В self.strategy.p.itp хранятся имена параметров params, которые оптимизируются (итераторы):
         - Формируем заголовок первой колонки params_head из этих имен, разделенных "-".
-        - Формируем ячейки (строки) первой колонки params_values из значений имен итерируемых параметров,
+        - Формируем ячейки (строки) первой колонки params_values из значений итерируемых параметров,
         полученных из self.strategy.p._getkwargs() для этого конкретного экземпляра стратегии. Значения
         также разделяются "-".
         '''
@@ -395,11 +264,7 @@ class SmartAnalyzer(Analyzer):
         self.rets['AvgLoss'] = al
 
         if self.strategy.p.write_history:
-
             for trade in self.trades:
-                # entry_event, exit_event = trade.history[0], trade.history[-1]
-                # entry_order, exit_order = entry_event.event.order, exit_event.event.order
-
                 entry_event, exit_event = trade.history[0].event, trade.history[-1].event
                 entry_order, exit_order = entry_event.order, exit_event.order
 
@@ -415,8 +280,6 @@ class SmartAnalyzer(Analyzer):
                     stop_loss_price=getattr(trade, 'stop_loss_price', 0),
                     size=entry_order.size,
                     entry_type='long' if entry_order.isbuy() else 'short',
-                    # entry_ma_disposition = entry_order.info.ma_disp,
-
                     exit_ref=exit_order.ref,
                     exit_created_date=f'{bt.num2date(exit_order.created.dt):%d.%m.%y}',
                     exit_created_time=f'{bt.num2date(exit_order.created.dt):%H:%M}',
@@ -424,11 +287,8 @@ class SmartAnalyzer(Analyzer):
                     exit_executed_time=f'{bt.num2date(exit_order.executed.dt):%H:%M}',
                     exit_requested_price=exit_order.created.price,
                     exit_executed_price=exit_order.executed.price,
-                    # exit_type=exit_order.info.name,
-
                     result=1 if trade.pnl > 0 else 0,
                     pnl=int(trade.pnlcomm),
-
                     cash_before=getattr(trade, 'start_cash', 0),
                     cash_after=getattr(trade, 'finish_cash', 0),
                 )
@@ -451,7 +311,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
     params = dict(
         write_history=None,  # Записываем или нет детальную инфу о каждой сделке
         depo=0,  # Начальный депозит
-        tf=None,
         risk=None,
         start_date=None,
         end_date=None,
@@ -638,7 +497,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
 
 def main(maxcpus=None):
-
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     # 26-04-26 50-0.34--0.48-1.5-MIX
     params = dict(
@@ -667,7 +525,7 @@ def main(maxcpus=None):
 
     # tf = params['tf'] = '15m'
     # tf = params['tf'] = '30m'
-    tf = params['tf'] = '1h'
+    tf = '1h'
     # tf = params['tf'] = '1d'
     # start_date = params['start_date'] = '2025-3-20'
     start_date = params['start_date'] = '2022-6-20'
