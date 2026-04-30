@@ -577,12 +577,9 @@ def main(maxcpus=None):
                                        fromdate=fromdate,
                                        todate=todate,
                                        tf=tf, name=contract)
-            # data.start_trades = prevexpdate
             data.start_trades = start_trades
             data.end_trades = pd.to_datetime(todate)
             data.sec = sec
-            # data.avg_volume = avg_vol(data)
-            # print(f'Contract: {contract}, average volume: {data.avg_volume}')
             datas.append(data)
 
     results = []
@@ -598,14 +595,10 @@ def main(maxcpus=None):
         cerebro.broker.setcash(params['depo'])
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
         cerebro.addsizer(AllInSizer)
-        # cerebro.addsizer(ATRRiskSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **aparams)
         cerebro.adddata(data)
 
         cerebro.optstrategy(AutoTuneFilterStrategy, **params)
-        # cerebro.optstrategy(TrioVesperFin_Chaikin, **params)
-        # cerebro.optstrategy(TrioChaikin, **params)
-        # cerebro.optstrategy(TrioChaikinWithTrailingExit, **params)
         runs = cerebro.run(stdstats=False, tradehistory=params["write_history"], maxcpus=maxcpus)
 
         for run in runs:  # тут все варианты для одного контракта

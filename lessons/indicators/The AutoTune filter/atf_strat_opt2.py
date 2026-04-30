@@ -61,7 +61,7 @@ futures_comm = dict( # Комиссии для фьючерсов
                           mult=0.97966/1,  # мультипликатор Стоимость шага цены/Шаг цены
                           moexcomm=FUTURE_TYPE['xindex']),
     CNY=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=1050,  # ГО 27/04/25
+                          margin=1050,  # ГО 27/04/25 27/04/26(!)
                           mult=1/0.001,  # мультипликатор
                           moexcomm=FUTURE_TYPE['currency']),
     Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
@@ -738,7 +738,7 @@ def main(maxcpus=None):
         cerebro = bt.Cerebro()
         cerebro.broker = bt.brokers.BackBroker()
         cerebro.broker.setcash(params['depo'])
-        cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
+        cerebro.broker.addcommissioninfo(futures_comm, name=data.p.name)
         cerebro.addsizer(AllInSizer)
         # cerebro.addsizer(ATRRiskSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **aparams)
