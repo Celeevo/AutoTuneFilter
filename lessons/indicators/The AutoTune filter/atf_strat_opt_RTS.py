@@ -20,6 +20,7 @@ from atf import AutoTuneFilter
 # ------------------------------------------------------------
 # 1. Настройка комиссии и округления цены
 # ------------------------------------------------------------
+
 class FuturesCommission(bt.CommInfoBase):
     """Комиссия для фьючерсов MOEX."""
     params = dict(moexcomm=0.0, step_of_cost=0)
@@ -31,11 +32,11 @@ class FuturesCommission(bt.CommInfoBase):
 
 
 futures_comm = FuturesCommission(
-    commission=2.0,  # 2 руб за контракт
-    margin=5905,  # ГО 30-04-26
-    mult=1/1,  # Стоимость шага цены/Шаг цены
-    moexcomm=0.01980,
-    step_of_cost=1,  # шаг цены
+    commission=2.0,      # брокерская комиссия, как у тебя в Si
+    margin=26536.97,     # ГО для RIM6 на 30-04-26
+    mult=1.497612,       # стоимость 1 пункта цены в рублях: 14.97612 / 10
+    moexcomm=0.00660,    # биржевая комиссия, чтобы дать ~10.97 руб при цене 111000
+    step_of_cost=10,     # шаг цены RTS
 )
 
 def round_to_nearest_price_step(step, value, isbuy):
@@ -103,8 +104,20 @@ class AllInSizer(bt.Sizer):
 
 def iterable_params(params_dict):
     """Возвращает только те параметры, которые реально оптимизируются."""
-    names = [k for k, v in params_dict.items() if isinstance(v, (list, tuple, set, range))]
-    return names if names else ['params']
+    return [k for k, v in params_dict.items() if isinstance(v, (list, tuple, set, range))]
+
+
+def count_param_variants(params_dict):
+    variants = 1
+    for value in params_dict.values():
+        if isinstance(value, (list, tuple, set, range)):
+            variants *= len(value)
+    return variants
+
+
+def get_strategy_params(params_dict, strategy_cls):
+    strategy_param_names = strategy_cls.params._getkeys()
+    return {name: value for name, value in params_dict.items() if name in strategy_param_names}
 
 
 def calculate_sharpe_and_drawdown(trade_pnls, starting_cash):
@@ -234,13 +247,13 @@ def aggregate_results(df, starting_cash):
     return table.sort_values(by='PnL', ascending=False).reset_index(drop=True)
 
 
-def save_and_open_csv(table, tf):
+def save_and_open_csv(table, sec, tf):
     """
     Сохраняет итоговую таблицу в CSV и пытается открыть файл
     в приложении, которое связано с CSV в операционной системе.
     """
     timestamp = datetime.now().strftime('%d-%m-%y_%H-%M-%S')
-    csv_file = f'opt_results_{tf}_{timestamp}.csv'
+    csv_file = f'opt_results_{sec}_{tf}_{timestamp}.csv'
 
     # utf-8-sig помогает Excel корректно показать русские заголовки
     table.to_csv(
@@ -294,8 +307,12 @@ class SmartAnalyzer(Analyzer):
 
     def stop(self):
         strategy_params = self.strategy.p._getkwargs()
-        params_head = '-'.join(str(name) for name in self.p.it_params)
-        params_str = '-'.join(str(strategy_params[name]) for name in self.p.it_params)
+        if self.p.it_params:
+            params_head = '-'.join(str(name) for name in self.p.it_params)
+            params_str = '-'.join(str(strategy_params[name]) for name in self.p.it_params)
+        else:
+            params_head = 'params'
+            params_str = 'default'
 
         self.rets[params_head] = params_str
         self.rets['PNL'] = int(sum(self.win_pnls + self.loss_pnls))
@@ -327,7 +344,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
     """
 
     params = dict(
-        depo=0,
         risk=None,
         window=26,
         bandwidth=0.22,
@@ -366,82 +382,61 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.stop_order = None
         self.take_profit_order = None
 
+    def _round_exit_price(self, price, isbuy):
+        comminfo = self.broker.getcommissioninfo(self.data)
+        if comminfo.p.step_of_cost == 0:
+            return price
+
+        return round_to_nearest_price_step(
+            comminfo.p.step_of_cost,
+            price,
+            isbuy,
+        )
+
+    def _reset_exit_state(self):
+        self.stop_order = None
+        self.take_profit_order = None
+        self.stop_loss_price = 0.0
+        self.take_profit_price = 0.0
+        self.entry_price = 0.0
+
+    def _place_exit_orders(self, order):
+        is_long_entry = order.isbuy()
+        exit_method = self.sell if is_long_entry else self.buy
+        exit_size = abs(order.executed.size)
+        executed_entry = order.executed.price
+        risk_points = abs(executed_entry - self.stop_loss_price)
+        direction = 1 if is_long_entry else -1
+        raw_take_profit = executed_entry + direction * self.p.tp_mult * risk_points
+
+        self.take_profit_price = self._round_exit_price(raw_take_profit, is_long_entry)
+        self.stop_order = exit_method(
+            exectype=bt.Order.Stop,
+            size=exit_size,
+            price=self.stop_loss_price,
+            name='stop_loss',
+        )
+        self.take_profit_order = exit_method(
+            exectype=bt.Order.Limit,
+            size=exit_size,
+            price=self.take_profit_price,
+            name='take_profit',
+            oco=self.stop_order,
+        )
+
     def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
+        if order.status in (order.Submitted, order.Accepted):
             return
 
         if order.status == order.Completed:
             # После входа сразу ставим stop-loss и take-profit
             if order.info.name in ('long', 'short'):
-                exit_size = abs(order.executed.size)
-                executed_entry = order.executed.price
-                risk_points = abs(executed_entry - self.stop_loss_price)
-                comminfo = self.broker.getcommissioninfo(self.data)
+                self._place_exit_orders(order)
 
-                if order.isbuy():
-                    raw_take_profit = executed_entry + self.p.tp_mult * risk_points
-                    if comminfo.p.step_of_cost != 0:
-                        self.take_profit_price = round_to_nearest_price_step(
-                            comminfo.p.step_of_cost,
-                            raw_take_profit,
-                            True,
-                        )
-                    else:
-                        self.take_profit_price = raw_take_profit
+            elif order.info.name in ('stop_loss', 'take_profit'):
+                self._reset_exit_state()
 
-                    self.stop_order = self.sell(
-                        exectype=bt.Order.Stop,
-                        size=exit_size,
-                        price=self.stop_loss_price,
-                        name='stop_loss',
-                    )
-                    self.take_profit_order = self.sell(
-                        exectype=bt.Order.Limit,
-                        size=exit_size,
-                        price=self.take_profit_price,
-                        name='take_profit',
-                        oco=self.stop_order,
-                    )
-                else:
-                    raw_take_profit = executed_entry - self.p.tp_mult * risk_points
-                    if comminfo.p.step_of_cost != 0:
-                        self.take_profit_price = round_to_nearest_price_step(
-                            comminfo.p.step_of_cost,
-                            raw_take_profit,
-                            False,
-                        )
-                    else:
-                        self.take_profit_price = raw_take_profit
-
-                    self.stop_order = self.buy(
-                        exectype=bt.Order.Stop,
-                        size=exit_size,
-                        price=self.stop_loss_price,
-                        name='stop_loss',
-                    )
-                    self.take_profit_order = self.buy(
-                        exectype=bt.Order.Limit,
-                        size=exit_size,
-                        price=self.take_profit_price,
-                        name='take_profit',
-                        oco=self.stop_order,
-                    )
-
-            elif order.info.name == 'stop_loss':
-                self.stop_order = None
-                self.take_profit_order = None
-                self.stop_loss_price = 0.0
-                self.take_profit_price = 0.0
-                self.entry_price = 0.0
-
-            elif order.info.name == 'take_profit':
-                self.take_profit_order = None
-                self.stop_order = None
-                self.stop_loss_price = 0.0
-                self.take_profit_price = 0.0
-                self.entry_price = 0.0
-
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
+        elif order.status in (order.Canceled, order.Margin, order.Rejected):
             if order == self.stop_order:
                 self.stop_order = None
             elif order == self.take_profit_order:
@@ -472,15 +467,14 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
 def main(maxcpus=None):
     # Здесь задаём параметры оптимизации.
-    # Для учебного примера они маленькие и понятные.
+    start_cash = 300000.0
     params = dict(
-        depo=300000.0,
         risk=5,
-        window=range(10,111,20),  #(14, 15, 16, 60), #(15, 20, 25, 30),
-        bandwidth=[0.2, 0.25, 0.3],
-        thresh=[-0.6, -0.65, -0.7, -0.75, -0.8],
+        window=range(31,41),
+        bandwidth=[i / 100 for i in range(16, 24)], #[0.4, 0.45, 0.45],
+        thresh=[-i / 100 for i in range(33, 55)], #[-0.45, -0.5, -0.55],
         allow_short=True,
-        tp_mult=[3, 3.2, 3.4, 3.6], #[i / 10 for i in range(17, 23)],  #[1.7, 1.8, 1.9, 2],
+        tp_mult=[i / 10 for i in range(11, 20)],  #[1.7, 1.8, 1.9, 2],
     )
 
     total_time = _time.time()
@@ -489,7 +483,7 @@ def main(maxcpus=None):
     end_date = datetime.today()
 
     # В примере используем фьючерсы на индекс Московской биржи.
-    sec = 'SBRF'
+    sec = 'RTS'
     store = MoexStore()
     datas = []
 
@@ -499,15 +493,7 @@ def main(maxcpus=None):
     contracts = store.futures.contracts_between(sec, start_date, end_date)
     print(contracts)
 
-    variants = 1
-    for value in params.values():
-        if isinstance(value, (tuple, range, list)):
-            variants *= len(value)
-
-    print(f'Рассчитываем {variants} вариантов стратегии для '
-          f'каждого из {len(contracts)} контрактов. Итого '
-          f'{variants * len(contracts)} вариантов.')
-    print(f'Время пошло, {str(datetime.now().time())[:8]}')
+    variants = count_param_variants(params)
 
     for contract in contracts:
         prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
@@ -529,8 +515,13 @@ def main(maxcpus=None):
             tf=tf,
             name=contract,
         )
-        # data.sec = sec
         datas.append(data)
+
+    print(
+        f'Источники загружены: {len(datas)} контракт(ов). '
+        f'Начинаем оптимизацию по {variants * len(datas)} прогонам, '
+        f'{datetime.now():%H:%M:%S}'
+    )
 
     # --------------------------------------------------------
     # Теперь запускаем оптимизацию отдельно для каждого контракта
@@ -538,18 +529,19 @@ def main(maxcpus=None):
     # --------------------------------------------------------
     results = []
     analyzer_params = dict(it_params=iterable_params(params))
+    strategy_params = get_strategy_params(params, AutoTuneFilterStrategy)
 
     for data in datas:
         st_time = _time.time()
 
         cerebro = bt.Cerebro()
         cerebro.broker = bt.brokers.BackBroker()
-        cerebro.broker.setcash(params['depo'])
+        cerebro.broker.setcash(start_cash)
         cerebro.broker.addcommissioninfo(futures_comm, name=data.p.name)
         cerebro.addsizer(AllInSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
         cerebro.adddata(data)
-        cerebro.optstrategy(AutoTuneFilterStrategy, **params)
+        cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
 
         runs = cerebro.run(stdstats=False, tradehistory=False, maxcpus=maxcpus)
 
@@ -562,10 +554,11 @@ def main(maxcpus=None):
                 results.append(analysis)
 
         elapsed = _time.time() - st_time
+        speed = round(len(runs) / elapsed, 2) if elapsed else 0.0
         print(
             f'Прогон {len(runs)} вариантов стратегии для контракта {data.p.name} '
             f'за {round(elapsed, 2)} сек., '
-            f'V = {round(len(runs) / elapsed, 2)} вар/сек'
+            f'V = {speed} вар/сек'
         )
         gc.collect()
 
@@ -579,11 +572,12 @@ def main(maxcpus=None):
     # сохраняем в CSV и открываем файл в ассоциированном приложении
     # --------------------------------------------------------
     df = pd.DataFrame(results).round(2)
-    table = aggregate_results(df, params['depo'])
-    save_and_open_csv(table, tf)
+    table = aggregate_results(df, start_cash)
+    save_and_open_csv(table, sec, tf)
 
 
 if __name__ == '__main__':
-    maxcpus = os.cpu_count()
-    print(f'Задействуем {maxcpus - 3} потоков и {maxcpus} возможных.')
+    cpu_count = os.cpu_count() or 1
+    maxcpus = max(1, cpu_count - 2)
+    print(f'Задействуем {maxcpus} потоков из {cpu_count} возможных.')
     main(maxcpus)

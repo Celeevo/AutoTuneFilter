@@ -498,7 +498,7 @@ def main(maxcpus=None):
     print(f'Рассчитываем {variants} вариантов стратегии для '
           f'каждого из {len(contracts)} контрактов. Итого '
           f'{variants * len(contracts)} вариантов.')
-    print(f'Время пошло, {str(datetime.now().time())[:8]}')
+    print(f'Время пошло, {datetime.now():%H:%M:%S}')
 
     for contract in contracts:
         prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
