@@ -78,8 +78,6 @@ class AllInSizer(bt.Sizer):
         size = int(max_size) - 1
         if size <= 0:
             return 0
-
-        # direction = 1 для long, -1 для short
         direction = 2 * isbuy - 1
         stop_loss_price = (
             self.strategy.entry_price
@@ -513,7 +511,6 @@ def main(maxcpus=None):
 
     for contract in contracts:
         prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
-
         if contract == contracts[0]:
             fromdate = pd.to_datetime(start_date) - timedelta(days=5)
         else:

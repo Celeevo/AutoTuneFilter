@@ -384,7 +384,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
                         self.take_profit_price = round_to_nearest_price_step(
                             comminfo.p.cost_of_price_step,
                             raw_take_profit,
-                            True,
+                            True
                         )
                     else:
                         self.take_profit_price = raw_take_profit
@@ -393,14 +393,14 @@ class AutoTuneFilterStrategy(bt.Strategy):
                         exectype=bt.Order.Stop,
                         size=exit_size,
                         price=self.stop_loss_price,
-                        name='stop_loss',
+                        name='stop_loss'
                     )
                     self.take_profit_order = self.sell(
                         exectype=bt.Order.Limit,
                         size=exit_size,
                         price=self.take_profit_price,
                         name='take_profit',
-                        oco=self.stop_order,
+                        oco=self.stop_order
                     )
                 else:
                     raw_take_profit = executed_entry - self.p.tp_mult * risk_points
@@ -408,7 +408,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
                         self.take_profit_price = round_to_nearest_price_step(
                             comminfo.p.cost_of_price_step,
                             raw_take_profit,
-                            False,
+                            False
                         )
                     else:
                         self.take_profit_price = raw_take_profit
@@ -417,14 +417,14 @@ class AutoTuneFilterStrategy(bt.Strategy):
                         exectype=bt.Order.Stop,
                         size=exit_size,
                         price=self.stop_loss_price,
-                        name='stop_loss',
+                        name='stop_loss'
                     )
                     self.take_profit_order = self.buy(
                         exectype=bt.Order.Limit,
                         size=exit_size,
                         price=self.take_profit_price,
                         name='take_profit',
-                        oco=self.stop_order,
+                        oco=self.stop_order
                     )
 
             elif order.info.name == 'stop_loss':

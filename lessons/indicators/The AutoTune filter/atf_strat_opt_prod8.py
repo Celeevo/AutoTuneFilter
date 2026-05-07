@@ -356,7 +356,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.atf = AutoTuneFilter(
             self.data.close,
             window=self.p.window,
-            bandwidth=self.p.bandwidth,
+            bandwidth=self.p.bandwidth
         )
 
         self.stop_loss_price = 0.0

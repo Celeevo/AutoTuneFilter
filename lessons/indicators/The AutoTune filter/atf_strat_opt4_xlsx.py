@@ -6,8 +6,6 @@ import time as _time
 from datetime import datetime, time, timedelta
 import backtrader as bt
 from moex_store import MoexStore
-import pandas as pd
-import math
 import gc
 from atf import AutoTuneFilter
 from backtrader import Analyzer
@@ -63,7 +61,8 @@ futures_comm = dict( # Комиссии для фьючерсов
     CNY=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=1050,  # ГО 27/04/25 27/04/26(!)
                           mult=1/0.001,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
+                          moexcomm=FUTURE_TYPE['currency'],
+                          cost_of_price_step=0.001),
     Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=15758,  # ГО  05.12.2024
                           mult=1,  # мультипликатор
@@ -213,10 +212,15 @@ def iterable_params(p:dict):
     и возвращаем имена (ключи params) тех, которые оптимизируются (итерируются)
     Если нет итерируемых параметров (такое бывает) - возвращаем строку 'params'
     '''
-    itp = [k for k,v in p.items() if isinstance(v, (list, tuple, set, range))]
-    if itp:
-        return itp
-    return 'params'
+    names = [k for k,v in p.items() if isinstance(v, (list, tuple, set, range))]
+    return names if names else ['params']
+
+def count_param_variants(params_dict):
+    variants = 1
+    for value in params_dict.values():
+        if isinstance(value, (list, tuple, set, range)):
+            variants *= len(value)
+    return variants
 
 def compute_group_metrics(group, startingcash=1):
     # Объединяем списки PNLs из группы
@@ -294,7 +298,7 @@ def compute_group_metrics(group, startingcash=1):
 
 def aggregate_df(df, startingcash=1, sort_by='s-Pardo', sort_by_second='s-Pardo'):
     first_col = df.columns[0]
-    aggr = df.groupby(first_col, sort=False).apply(compute_group_metrics, startingcash=startingcash).reset_index()
+    aggr = df.groupby(first_col, sort=False)[['PNLs', 'PNL', 'Asset']].apply(compute_group_metrics, startingcash=startingcash).reset_index()
     aggr = aggr.sort_values(sort_by, ascending=False)
     # Проверка значения в столбце 's-Pardo' и вторичная сортировка при необходимости
     if 's-Pardo' in aggr.columns and aggr['s-Pardo'].iloc[0] <= 0:
@@ -450,11 +454,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
     params = dict(
         write_history=None,  # Записываем или нет детальную инфу о каждой сделке
-        depo=0,  # Начальный депозит
-        tf=None,
         risk=None,
-        start_date=None,
-        end_date=None,
         window=26,
         bandwidth=0.22,
         thresh=-0.22,
@@ -475,165 +475,149 @@ class AutoTuneFilterStrategy(bt.Strategy):
             bandwidth=self.p.bandwidth
         )
 
-        self.stop_loss_price, self.entry_price = 0.0, 0.0
+        self.stop_loss_price = 0.0
+        self.entry_price = 0.0
         self.take_profit_price = 0.0
 
-        # ROC из статьи: BP - BP[2]
         self.roc = self.atf.bp - self.atf.bp(-2)
-
-        # Сигналы пересечения нуля
         self.cross_up = bt.indicators.CrossUp(self.roc, 0.0)
         self.cross_down = bt.indicators.CrossDown(self.roc, 0.0)
+
+        self.long_signal = bt.And(
+            self.cross_up,
+            self.atf.mincorr < self.p.thresh
+        )
+
+        self.short_signal = bt.And(
+            self.cross_down,
+            self.atf.mincorr < self.p.thresh,
+            self.atf.filt > 0
+        )
 
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
 
+    def _reset_bracket_state(self):
+        self.order = None
+        self.stop_order = None
+        self.take_profit_order = None
+        self.stop_loss_price = 0.0
+        self.take_profit_price = 0.0
+        self.entry_price = 0.0
+
+    def _has_active_orders(self):
+        return any(
+            order is not None and order.alive()
+            for order in (self.order, self.stop_order, self.take_profit_order)
+        )
+
+    def _round_exit_price(self, comminfo, price, isbuy):
+        if comminfo.p.cost_of_price_step != 0:
+            return round_to_nearest_price_step(comminfo.p.cost_of_price_step, price, isbuy)
+        return price
+
+    def _calc_bracket_params(self, isbuy):
+        comminfo = self.broker.getcommissioninfo(self.data)
+        cash = self.broker.getcash()
+        self.entry_price = self.data.close[0]
+
+        if self.entry_price <= 0:
+            return None
+
+        if comminfo.p.margin:
+            max_size = cash / comminfo.p.margin
+        else:
+            max_size = cash / self.entry_price
+
+        size = int(max_size) - 1
+        if size <= 0:
+            return None
+
+        direction = 1 if isbuy else -1
+        raw_stop_loss = (
+            self.entry_price
+            - direction * cash * (self.p.risk / 100) / (size * comminfo.p.mult)
+        )
+        self.stop_loss_price = self._round_exit_price(comminfo, raw_stop_loss, isbuy)
+
+        risk_points = abs(self.entry_price - self.stop_loss_price)
+        if risk_points <= 0:
+            return None
+
+        raw_take_profit = self.entry_price + direction * self.p.tp_mult * risk_points
+        self.take_profit_price = self._round_exit_price(comminfo, raw_take_profit, isbuy)
+
+        return size, self.stop_loss_price, self.take_profit_price
+
+    def _submit_bracket(self, isbuy):
+        bracket_params = self._calc_bracket_params(isbuy)
+        if bracket_params is None:
+            return
+
+        size, stop_price, limit_price = bracket_params
+        side = 'long' if isbuy else 'short'
+        bracket_name = 'buy_bracket' if isbuy else 'sell_bracket'
+        self.log(f'{side.upper()} SIGNAL -> {bracket_name}()')
+
+        bracket_method = self.buy_bracket if isbuy else self.sell_bracket
+        self.order, self.stop_order, self.take_profit_order = bracket_method(
+            size=size,
+            exectype=bt.Order.Market,
+            stopprice=stop_price,
+            stopexec=bt.Order.Stop,
+            limitprice=limit_price,
+            limitexec=bt.Order.Limit,
+            oargs={'name': side},
+            # BackBroker pre-checks bracket children as sequential independent
+            # orders. Disable child checks to avoid false Margin on OCO exits.
+            stopargs={'name': 'stop_loss', '_checksubmit': False},
+            limitargs={'name': 'take_profit', '_checksubmit': False},
+        )
+
+        self.log(
+            f'STOP={self.stop_loss_price:.2f} | '
+            f'TP({self.p.tp_mult}R)={self.take_profit_price:.2f}'
+        )
+
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
 
+        order_name = getattr(order.info, 'name', None)
+
         if order.status == order.Completed:
-            if order.info.name in ('long', 'short'):
-                exit_size = abs(order.executed.size)
-                executed_entry = order.executed.price
-                risk_points = abs(executed_entry - self.stop_loss_price)
-
-                comminfo = self.broker.getcommissioninfo(self.data)
-
-                if order.isbuy():
-                    self.log(f'BUY EXECUTED at {executed_entry:.2f}')
-
-                    raw_take_profit = executed_entry + self.p.tp_mult * risk_points
-                    if comminfo.p.cost_of_price_step != 0:
-                        # тейк для long округляем К ВХОДУ, т.е. вниз
-                        self.take_profit_price = round_to_nearest_price_step(
-                            comminfo.p.cost_of_price_step,
-                            raw_take_profit,
-                            True
-                        )
-                    else:
-                        self.take_profit_price = raw_take_profit
-
-                    self.stop_order = self.sell(
-                        exectype=bt.Order.Stop,
-                        size=exit_size,
-                        price=self.stop_loss_price,
-                        name='stop_loss'
-                    )
-                    self.take_profit_order = self.sell(
-                        exectype=bt.Order.Limit,
-                        size=exit_size,
-                        price=self.take_profit_price,
-                        name='take_profit',
-                        oco=self.stop_order
-                    )
-
-                else:
-                    self.log(f'SELL EXECUTED at {executed_entry:.2f}')
-
-                    raw_take_profit = executed_entry - self.p.tp_mult * risk_points
-                    if comminfo.p.cost_of_price_step != 0:
-                        # тейк для short округляем К ВХОДУ, т.е. вверх
-                        self.take_profit_price = round_to_nearest_price_step(
-                            comminfo.p.cost_of_price_step,
-                            raw_take_profit,
-                            False
-                        )
-                    else:
-                        self.take_profit_price = raw_take_profit
-
-                    self.stop_order = self.buy(
-                        exectype=bt.Order.Stop,
-                        size=exit_size,
-                        price=self.stop_loss_price,
-                        name='stop_loss'
-                    )
-                    self.take_profit_order = self.buy(
-                        exectype=bt.Order.Limit,
-                        size=exit_size,
-                        price=self.take_profit_price,
-                        name='take_profit',
-                        oco=self.stop_order
-                    )
-
-                self.log(
-                    f'STOP={self.stop_loss_price:.2f} | '
-                    f'TP(2R)={self.take_profit_price:.2f}'
-                )
-
-            # ---------- исполнился stop-loss ----------
-            elif order.info.name == 'stop_loss':
+            if order_name == 'long':
+                self.log(f'BUY EXECUTED at {order.executed.price:.2f}')
+                self.order = None
+            elif order_name == 'short':
+                self.log(f'SELL EXECUTED at {order.executed.price:.2f}')
+                self.order = None
+            elif order_name == 'stop_loss':
                 self.log(f'STOP LOSS EXECUTED at {order.executed.price:.2f}')
-                self.stop_order = None
-                self.take_profit_order = None
-                self.stop_loss_price = 0.0
-                self.take_profit_price = 0.0
-                self.entry_price = 0.0
-
-            # ---------- исполнился take-profit ----------
-            elif order.info.name == 'take_profit':
+                self._reset_bracket_state()
+            elif order_name == 'take_profit':
                 self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
-                self.take_profit_order = None
-                self.stop_order = None
-                self.stop_loss_price = 0.0
-                self.take_profit_price = 0.0
-                self.entry_price = 0.0
+                self._reset_bracket_state()
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log(f'ORDER FAILED: {order.getstatusname()}')
-            if order == self.stop_order:
+            self.log(f'ORDER {order_name} FAILED: {order.getstatusname()}')
+
+            if order_name in ('long', 'short'):
+                self._reset_bracket_state()
+            elif order_name == 'stop_loss':
                 self.stop_order = None
-            elif order == self.take_profit_order:
+            elif order_name == 'take_profit':
                 self.take_profit_order = None
 
-        self.order = None
-
     def next(self):
-        if self.order:
+        if self.position or self._has_active_orders():
             return
 
-        roc_now = self.roc[0]
-        mincorr_now = self.atf.mincorr[0]
-        filt_now = self.atf.filt[0]
-        dc_now = self.atf.dc[0]
-        bp_now = self.atf.bp[0]
-
-        long_signal = bool(self.cross_up[0] and mincorr_now < self.p.thresh)
-        short_signal = bool(
-            self.cross_down[0]
-            and mincorr_now < self.p.thresh
-            and filt_now > 0
-        )
-
-        self.log(
-            f'close={self.data.close[0]:.2f} | '
-            f'bp={bp_now:.6f} | roc={roc_now:.6f} | '
-            f'mincorr={mincorr_now:.6f} | filt={filt_now:.6f} | dc={dc_now:.2f}'
-        )
-
-        # Нет позиции
-        if not self.position:
-            if long_signal:
-                self.log('LONG SIGNAL -> buy()')
-                self.entry_price = self.data.close[0]
-                self.order = self.buy(name='long')
-
-            elif self.p.allow_short and short_signal:
-                self.log('SHORT SIGNAL -> sell()')
-                self.entry_price = self.data.close[0]
-                self.order = self.sell(name='short')
-
-            return
-
-        # Если позиция уже есть, новых действий не делаем.
-        # Выход только по stop-loss или take-profit.
-        if self.position:
-            return
-
-        # Если выходные ордера ещё висят, тоже ничего не делаем
-        if self.stop_order or self.take_profit_order:
-            return
+        if self.long_signal[0]:
+            self._submit_bracket(isbuy=True)
+        elif self.p.allow_short and self.short_signal[0]:
+            self._submit_bracket(isbuy=False)
 
 
 
@@ -641,9 +625,9 @@ def main(maxcpus=None):
 
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     # 26-04-26 50-0.34--0.48-1.5-MIX
+    start_cash = 300000.0
     params = dict(
         write_history=True,
-        depo=300000.0,  # Начальный депозит
         risk=5,
         window=50,  #range(16,57),  #30,
         bandwidth=[i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
@@ -652,96 +636,92 @@ def main(maxcpus=None):
         printlog=False,
         tp_mult=[1+i/10 for i in range(1,7)],   # тейк-профит в R
     )
-    params = dict(
+    params = dict( # CNY_1h - final 07-05-26
         write_history=True,
-        depo=300000.0,  # Начальный депозит
         risk=5,
-        window=[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        window=28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=[i / 100 for i in range(43, 48)], #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=[-i / 100 for i in range(65, 86)],  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
-        tp_mult=1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        tp_mult=[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
     )
 
 
     # tf = params['tf'] = '15m'
     # tf = params['tf'] = '30m'
-    tf = params['tf'] = '1h'
+    # tf = params['tf'] = '1h'
+    tf = '1h'
     # tf = params['tf'] = '1d'
     # start_date = params['start_date'] = '2025-3-20'
-    start_date = params['start_date'] = '2022-6-20'
+    start_date = '2025-6-20'
 
     # end_date = params['end_date'] = '2026-3-17'  # datetime.today()
-    end_date = params['end_date'] = datetime.today()
+    end_date = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
 
     # futures = ['RTS', 'RTSM', 'NASD', 'CNY', 'Eu', 'NG', 'GOLD', 'SBRF']
-    futures = ['MIX', ]
+    futures = ['CNY', ]
     # futures = ['Si', ]
     # futures = ['RTS', ]
     # futures = ['SPYF', ]
 
+    sec = 'CNY'
     total_time = _time.time()
     store = MoexStore()
     datas = list()
 
-    for sec in futures:
-        contracts = store.futures.contracts_between(sec, start_date, end_date)
-        print(contracts)
+    # for sec in futures:
+    contracts = store.futures.contracts_between(sec, start_date, end_date)
+    print(contracts)
 
-        variants = 1
-        for v in params.values():
-            if isinstance(v, (tuple, range, list)):
-                variants *= len(v)
-        sheet_size = (variants * len(contracts)) > 1048576
-        if sheet_size:
-            print(f"Excel sheet is too large! Your sheet size is: {variants * len(contracts)}, Max sheet size is: 1'048'576")
-        print(
-            f'Рассчитываем {variants} вариантов стратегии для каждого из {len(contracts)} контрактов. Итого {variants * len(contracts)} '
-            f'вариантов, est. time = {round(variants * len(contracts) / 50 / 60 / 60, 2)} часов.')
-        print(f'Время пошло, {datetime.now():%H:%M:%S}')
+    variants = count_param_variants(params)
 
-        for contract in contracts:
-            prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
-            if contract == contracts[0]:
-                fromdate = pd.to_datetime(start_date) - timedelta(days=5)
-                start_trades = pd.to_datetime(start_date)
-            else:
-                fromdate = prevexpdate - timedelta(days=5)
-                start_trades = prevexpdate
-            if contract == contracts[-1]:
-                todate = end_date
-            else:
-                todate = store.futures.expdate(contract)
 
-            data = store.getdata(sec_id=contract,
-                                       fromdate=fromdate,
-                                       todate=todate,
-                                       tf=tf, name=contract)
-            # data.start_trades = prevexpdate
-            data.start_trades = start_trades
-            data.end_trades = pd.to_datetime(todate)
-            data.sec = sec
-            # data.avg_volume = avg_vol(data)
-            # print(f'Contract: {contract}, average volume: {data.avg_volume}')
-            datas.append(data)
+    sheet_size = (variants * len(contracts)) > 1048576
+    if sheet_size:
+        print(f"Excel sheet is too large! Your sheet size is: {variants * len(contracts)}, Max sheet size is: 1'048'576")
+    print(f'Рассчитываем {variants} вариантов стратегии для '
+          f'каждого из {len(contracts)} контрактов. Итого '
+          f'{variants * len(contracts)} вариантов.')
+    print(f'Время пошло, {datetime.now():%H:%M:%S}')
+
+    for contract in contracts:
+        prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
+
+        if contract == contracts[0]:
+            fromdate = pd.to_datetime(start_date) - timedelta(days=5)
+            # start_trades = pd.to_datetime(start_date)
+        else:
+            fromdate = prevexpdate - timedelta(days=5)
+            # start_trades = prevexpdate
+        if contract == contracts[-1]:
+            todate = end_date
+        else:
+            todate = store.futures.expdate(contract)
+
+        data = store.getdata(sec_id=contract,
+                                   fromdate=fromdate,
+                                   todate=todate,
+                                   tf=tf, name=contract)
+
+        data.sec = sec
+        datas.append(data)
 
     results = []
     trades = []
-    # it_params = iterable_params(params)
-    aparams = dict(it_params=iterable_params(params))
+    analyzer_params = dict(it_params=iterable_params(params))
 
     for data in datas:
-        aparams['asset'] = data.sec
+        analyzer_params['asset'] = data.sec
         st_time = _time.time()
         cerebro = bt.Cerebro()
         cerebro.broker = bt.brokers.BackBroker()
-        cerebro.broker.setcash(params['depo'])
+        cerebro.broker.setcash(start_cash)
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
         cerebro.addsizer(AllInSizer)
         # cerebro.addsizer(ATRRiskSizer)
-        cerebro.addanalyzer(SmartAnalyzer, _name='full', **aparams)
+        cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
         cerebro.adddata(data)
 
         cerebro.optstrategy(AutoTuneFilterStrategy, **params)
@@ -779,15 +759,16 @@ def main(maxcpus=None):
     df1 = pd.DataFrame(results).round(2)
     if params['write_history']:
         df2 = pd.DataFrame(trades).round(3)
-    df3 = aggregate_df(df1, params['depo'], sort_by=main_opt_metric)
+    # df3 = aggregate_df(df1, params['depo'], sort_by=main_opt_metric)
+    df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
     df4 = pd.DataFrame(list(params.items()), columns=['Parameter', 'Value'])
     del df1['PNLs']
 
     # Сохраняем штамп времени для имени XLSX-файла с результатами
-    timestamp = datetime.now().strftime("%d-%m-%y %H-%M-%S")
+    timestamp = datetime.now().strftime("%d-%m-%y %H-%M")
 
     # Создаём имя XLSX-файла результатов
-    results_file = f'opt_results_{tf}_{timestamp}.xlsx'
+    results_file = f'opt_results_{sec}_{tf}_{timestamp}.xlsx'
 
     # Записываем df в xlsx файл, xlsxwriter импортируем
     # отдельно pip install xlsxwriter
