@@ -48,9 +48,10 @@ class StockCommission(bt.CommInfoBase):
 
 futures_comm = dict( # Комиссии для фьючерсов
     RTS=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=29000, # 27/04/25, 24700,  # ГО 05.12.2024 07-05-26 - 26684.29
-                          mult=16.53098/10,  # мультипликатор Стоимость шага цены/Шаг цены 07-05-26 - 15.04492
-                          moexcomm=FUTURE_TYPE['xindex']),
+                          margin=26358, # 27/04/25, 24700,  # ГО 05.12.2024 08-05-26
+                          mult=14.92418/10,  # мультипликатор Стоимость шага цены/Шаг цены 07-05-26 - 15.04492
+                          moexcomm=FUTURE_TYPE['xindex'],
+                          cost_of_price_step=10),
     RTSM=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=2900,  # 27/04/25, 2470,  # ГО 05.12.2024
                           mult=8.26549/0.5,  # мультипликатор Стоимость шага цены/Шаг цены
@@ -65,9 +66,10 @@ futures_comm = dict( # Комиссии для фьючерсов
                           moexcomm=FUTURE_TYPE['currency'],
                           cost_of_price_step=0.001),
     Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=11884,  # ГО  05.12.2024 07-05-26
+                          margin=11934,  # ГО  05.12.2024 07-05-26
                           mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
+                          moexcomm=FUTURE_TYPE['currency'],
+                          cost_of_price_step=1),
     Eu=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=16000,  # ГО
                           mult=1,  # мультипликатор
@@ -762,7 +764,6 @@ def main(maxcpus=None):
     df1 = pd.DataFrame(results).round(2)
     if params['write_history']:
         df2 = pd.DataFrame(trades).round(3)
-    # df3 = aggregate_df(df1, params['depo'], sort_by=main_opt_metric)
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
     df4 = pd.DataFrame(list(params.items()), columns=['Parameter', 'Value'])
     del df1['PNLs']
@@ -788,7 +789,7 @@ def main(maxcpus=None):
 
 if __name__ == '__main__':
     maxcpus = os.cpu_count()
-    available_cpus = maxcpus - 6
+    available_cpus = maxcpus - 3
     print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
     main(available_cpus)
 
@@ -806,7 +807,7 @@ if __name__ == '__main__':
         tp_mult=[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
     )
     
-        params = dict( # RTS_1h 
+        params = dict( # RTS_1h
         write_history=True,
         risk=5,
         window=range(31, 44),
@@ -815,5 +816,16 @@ if __name__ == '__main__':
         allow_short=True,
         tp_mult=[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
         printlog=False
+        
+        params = dict(  # RTS_1h  - final 07-05-26, для 1 год - 670_375, для 4 - 1_044_848 плохо !
+        write_history=True,
+        risk=5,
+        window=36,  #range(31, 44),
+        bandwidth=0.21,  #[i / 100 for i in range(19, 24)],  # [0.4, 0.45, 0.45],
+        thresh=-0.48,  #[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
+        allow_short=True,
+        tp_mult=1.2,  #[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
+        printlog=False
+    )
     )
 '''
