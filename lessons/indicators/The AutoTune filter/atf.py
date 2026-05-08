@@ -41,9 +41,9 @@ class AutoTuneFilter(bt.Indicator):
 
     plotlines = dict(
         bp=dict(_name='AutoTune BP'),
-        filt=dict(_name='HighPass', _plotskip=True),
-        mincorr=dict(_name='MinCorr', _plotskip=True),
-        dc=dict(_name='DominantCycle', _plotskip=True),
+        filt=dict(_name='HighPass'),
+        mincorr=dict(_name='MinCorr'),
+        dc=dict(_name='DominantCycle'),  # , _plotskip=True
     )
 
     # -----------------------------------------------------------------
@@ -178,7 +178,6 @@ class AutoTuneFilter(bt.Indicator):
         # =============================================================
         w = 1.414 * math.pi / window
         q = math.exp(-w)
-
         c1 = 2.0 * q * math.cos(w)
         c2 = q * q
         a0 = 0.25 * (1.0 + c1 + c2)

@@ -5,6 +5,7 @@ import os
 import time as _time
 from datetime import datetime, time, timedelta
 import backtrader as bt
+from matplotlib.style.core import available
 from moex_store import MoexStore
 import gc
 from atf import AutoTuneFilter
@@ -47,8 +48,8 @@ class StockCommission(bt.CommInfoBase):
 
 futures_comm = dict( # Комиссии для фьючерсов
     RTS=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=29000, # 27/04/25, 24700,  # ГО 05.12.2024
-                          mult=16.53098/10,  # мультипликатор Стоимость шага цены/Шаг цены
+                          margin=29000, # 27/04/25, 24700,  # ГО 05.12.2024 07-05-26 - 26684.29
+                          mult=16.53098/10,  # мультипликатор Стоимость шага цены/Шаг цены 07-05-26 - 15.04492
                           moexcomm=FUTURE_TYPE['xindex']),
     RTSM=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=2900,  # 27/04/25, 2470,  # ГО 05.12.2024
@@ -64,7 +65,7 @@ futures_comm = dict( # Комиссии для фьючерсов
                           moexcomm=FUTURE_TYPE['currency'],
                           cost_of_price_step=0.001),
     Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=15758,  # ГО  05.12.2024
+                          margin=11884,  # ГО  05.12.2024 07-05-26
                           mult=1,  # мультипликатор
                           moexcomm=FUTURE_TYPE['currency']),
     Eu=FuturesCommission(commission=2.0,  # 2 руб за контракт
@@ -573,6 +574,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
             # orders. Disable child checks to avoid false Margin on OCO exits.
             stopargs={'name': 'stop_loss', '_checksubmit': False},
             limitargs={'name': 'take_profit', '_checksubmit': False},
+            # stopargs={'name': 'stop_loss'},
+            # limitargs={'name': 'take_profit'},
         )
 
         self.log(
@@ -622,20 +625,10 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
 
 def main(maxcpus=None):
-
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     # 26-04-26 50-0.34--0.48-1.5-MIX
     start_cash = 300000.0
-    params = dict(
-        write_history=True,
-        risk=5,
-        window=50,  #range(16,57),  #30,
-        bandwidth=[i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
-        allow_short=True,
-        printlog=False,
-        tp_mult=[1+i/10 for i in range(1,7)],   # тейк-профит в R
-    )
+
     params = dict( # CNY_1h - final 07-05-26
         write_history=True,
         risk=5,
@@ -647,26 +640,36 @@ def main(maxcpus=None):
         tp_mult=[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
     )
 
+    params = dict(  # RTS_1h
+        write_history=True,
+        risk=5,
+        window=36,  #range(31, 44),
+        bandwidth=0.21,  #[i / 100 for i in range(19, 24)],  # [0.4, 0.45, 0.45],
+        thresh=-0.48,  #[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
+        allow_short=True,
+        tp_mult=1.2,  #[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
+        printlog=False
+    )
+
 
     # tf = params['tf'] = '15m'
     # tf = params['tf'] = '30m'
     # tf = params['tf'] = '1h'
     tf = '1h'
     # tf = params['tf'] = '1d'
-    # start_date = params['start_date'] = '2025-3-20'
-    start_date = '2025-6-20'
+    start_date = '2022-6-20'
 
     # end_date = params['end_date'] = '2026-3-17'  # datetime.today()
     end_date = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
 
     # futures = ['RTS', 'RTSM', 'NASD', 'CNY', 'Eu', 'NG', 'GOLD', 'SBRF']
-    futures = ['CNY', ]
+    # futures = ['CNY', ]
     # futures = ['Si', ]
     # futures = ['RTS', ]
     # futures = ['SPYF', ]
 
-    sec = 'CNY'
+    sec = 'RTS'  # 'CNY'
     total_time = _time.time()
     store = MoexStore()
     datas = list()
@@ -785,5 +788,32 @@ def main(maxcpus=None):
 
 if __name__ == '__main__':
     maxcpus = os.cpu_count()
-    print(f'Задействуем {maxcpus - 3} потоков и {maxcpus} возможных.')
-    main(maxcpus)
+    available_cpus = maxcpus - 6
+    print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
+    main(available_cpus)
+
+
+# -------------------------------------------------------
+'''
+    params = dict( # CNY_1h - final 07-05-26, для 1 год - хорошо, для 4 - плохо!
+        write_history=True,
+        risk=5,
+        window=28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=[i / 100 for i in range(43, 48)], #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=[-i / 100 for i in range(65, 86)],  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        allow_short=True,
+        printlog=False,
+        tp_mult=[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+    )
+    
+        params = dict( # RTS_1h 
+        write_history=True,
+        risk=5,
+        window=range(31, 44),
+        bandwidth=[i / 100 for i in range(19, 24)],  # [0.4, 0.45, 0.45],
+        thresh=[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
+        allow_short=True,
+        tp_mult=[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
+        printlog=False
+    )
+'''

@@ -31,6 +31,11 @@ class AutoTuneFilter(bt.Indicator):
         dc=dict(_name='DominantCycle'),  # , _plotskip=True
     )
 
+    def __init__(self):
+        # Резервируем достаточную глубину истории для самой длинной свёртки:
+        # автокорреляция на лаге window обращается к filt[-(2*window-1)].
+        self.addminperiod(2 * self.p.window + 5)
+
     @staticmethod
     def _safe(value, default=0.0):
         """
@@ -101,6 +106,16 @@ class AutoTuneFilter(bt.Indicator):
             )
 
         self.l.filt[0] = filt
+
+        # Warmup: пока истории не хватает на полную свёртку для всех лагов,
+        # эмулируем семантику Pine (там corr форсируется в 1 через na-распространение).
+        # Это даёт mincorr=1 → best_lag=1 → dc=2, как в Pine на ранних барах.
+        warmup = 2 * int(self.p.window)
+        if len(self) < warmup:
+            self.l.mincorr[0] = 1.0
+            self.l.dc[0] = 2.0
+            self.l.bp[0] = 0.0
+            return
 
         # =============================================================
         # 2) ROLLING AUTOCORRELATION
