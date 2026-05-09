@@ -268,5 +268,6 @@ if __name__ == '__main__':
 
     # runonce=False удобнее для пошаговой отладки рекурсивной логики angle/state.
     results = cerebro.run(runonce=False)
-    cerebro.plot(style='candle')
     plot(cerebro)
+    cerebro.plot(style='candle')
+

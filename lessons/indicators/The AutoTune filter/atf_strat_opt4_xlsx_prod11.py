@@ -20,6 +20,12 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 
 # 08-05-26 Это пока крайняя версия, новая opt5 - в тесте, версии opt_csv имеют упрощенный
 #           вывод результата и пока дальше не развиваем.
+# 09-05-26 Добавил фильтры по dc и adx. Семантика границ такая:
+#           - min_dc=25 означает «вход разрешён, если dc >= 25», то есть отсекаются сделки с dc < 25.
+#           - max_adx=40 означает «вход разрешён, если adx <= 40», отсекаются сделки с adx > 40.
+#           Дефлтные значения (фильтры выключены):
+#           - min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
+#           - max_adx=999,   # максимальный ADX(14) для входа
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -155,62 +161,6 @@ class AllInSizer(bt.Sizer):
         # print(f'SIZER: {data.p.name = }, {cash = }, {comminfo.p.margin = }, {comminfo.p.mult = }, {size = }, {self.strategy.entry_price = }, {self.strategy.stop_loss_price = }, {isbuy = }')
         return size
 
-
-class ATRRiskSizer(bt.Sizer):
-    """
-        Размер позиции для фьючерсов:
-        - по риску до ATR-стопа
-        - с учётом ограничения по ГО
-
-        Стратегия ДО buy()/sell() должна записать:
-        - self.entry_price
-        - self.stop_loss_price
-
-        Логика:
-            size_by_risk  = risk_cash / (stop_dist * mult)
-            size_by_go    = cash / margin
-            size          = min(size_by_risk, size_by_go)
-
-        Где:
-        - mult   = денежная стоимость 1 пункта движения на 1 контракт
-        - margin = ГО на 1 контракт
-        """
-
-    def _getsizing(self, comminfo, cash, data, isbuy):
-        entry_price = getattr(self.strategy, 'entry_price', None)
-        stop_loss_price = getattr(self.strategy, 'stop_loss_price', None)
-
-        if entry_price is None or stop_loss_price is None:
-            return 0
-
-        stop_dist = abs(entry_price - stop_loss_price)
-        if stop_dist <= 0:
-            return 0
-
-        # Риск в деньгах — как у тебя раньше: % от текущего cash
-        risk_cash = cash * (self.strategy.p.risk / 100)
-
-        # Денежный риск на 1 контракт
-        risk_per_contract = stop_dist * comminfo.p.mult
-        if risk_per_contract <= 0:
-            return 0
-
-        # Размер по риску
-        size_by_risk = risk_cash / risk_per_contract
-
-        # Размер по ГО
-        if comminfo.p.margin:
-            size_by_go = cash / comminfo.p.margin
-        else:
-            size_by_go = cash / entry_price
-
-        # Как и в твоём AllInSizer, оставим запас в 1 контракт
-        size = int(min(size_by_risk, size_by_go)) - 1
-
-        if size <= 0:
-            return 0
-
-        return size
 
 def iterable_params(p:dict):
     '''
@@ -456,6 +406,15 @@ class AutoTuneFilterStrategy(bt.Strategy):
     - ROC = BP - BP[2]
     - Long  when ROC crosses above 0 and MinCorr < Thresh
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
+
+    В этой версии (prod11) добавлены два дополнительных фильтра входа:
+      * min_dc  — минимальный доминирующий цикл AutoTune. Сделки с dc < min_dc
+                  не открываются (короткие циклы = шум, на нём mean-reversion
+                  систематически проигрывает).
+      * max_adx — максимальный ADX(14). Сделки при ADX > max_adx не
+                  открываются (на сильном тренде возврат к среднему ломается).
+    Нейтральные дефолты (min_dc=0, max_adx=999) воспроизводят прежнее
+    поведение стратегии.
     """
 
     params = dict(
@@ -467,6 +426,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
         allow_short=True,
         printlog=False,
         tp_mult=2.0,   # тейк-профит в R
+        # === Дополнительные фильтры на условие входа =========================
+        # Нейтральные дефолты (фильтры выключены): min_dc=0, max_adx=999.
+        # Чтобы активировать — задайте конкретные значения (например, 25 и 40
+        # по результатам диагностического анализа).
+        min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
+        max_adx=999,   # максимальный ADX(14) для входа
     )
 
     def log(self, txt):
@@ -480,6 +445,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
+        # Индикатор для фильтра max_adx. period=14 — стандарт.
+        self.adx = bt.indicators.ADX(self.data, period=14)
 
         self.stop_loss_price = 0.0
         self.entry_price = 0.0
@@ -489,15 +456,25 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.cross_up = bt.indicators.CrossUp(self.roc, 0.0)
         self.cross_down = bt.indicators.CrossDown(self.roc, 0.0)
 
+        # Базовые условия входа из статьи + два дополнительных фильтра:
+        #   self.atf.dc >= self.p.min_dc   -> отсекаем короткие циклы (шум)
+        #   self.adx    <= self.p.max_adx  -> отсекаем сильные тренды,
+        #                                     где mean-reversion ломается
+        # При нейтральных дефолтах (min_dc=0, max_adx=999) условия истинны
+        # всегда и поведение стратегии совпадает с предыдущей версией.
         self.long_signal = bt.And(
             self.cross_up,
-            self.atf.mincorr < self.p.thresh
+            self.atf.mincorr < self.p.thresh,
+            self.atf.dc >= self.p.min_dc,
+            self.adx <= self.p.max_adx,
         )
 
         self.short_signal = bt.And(
             self.cross_down,
             self.atf.mincorr < self.p.thresh,
-            self.atf.filt > 0
+            self.atf.filt > 0,
+            self.atf.dc >= self.p.min_dc,
+            self.adx <= self.p.max_adx,
         )
 
         self.order = None
@@ -631,7 +608,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
 def main(maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
-    # 26-04-26 50-0.34--0.48-1.5-MIX
     start_cash = 300000.0
 
     params = dict( # CNY_1h - final 07-05-26
@@ -643,6 +619,12 @@ def main(maxcpus=None):
         allow_short=True,
         printlog=False,
         tp_mult=1.8,  #[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        # === Фильтры входа (prod11) ===
+        # Дефолты ниже — фильтры выключены; чтобы оптимизировать, замените
+        # на range или список, например: min_dc=range(20, 36, 5),
+        #                                max_adx=range(30, 51, 5),
+        min_dc=range(5, 22),
+        max_adx=range(45, 72, 2),
     )
 
     params1 = dict(  # RTS_1h - final 08-05-26
@@ -653,7 +635,12 @@ def main(maxcpus=None):
         thresh=-0.48,  #[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
         allow_short=True,
         tp_mult=1.2,  #[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
-        printlog=False
+        printlog=False,
+        # === Фильтры входа (prod11) ===
+        # Кандидаты по диагностическому анализу: min_dc=25, max_adx=40.
+        # Для оптимизации: min_dc=range(15, 36, 5), max_adx=range(30, 51, 5).
+        min_dc=0,
+        max_adx=999,
     )
 
     params1 = dict(  # SIM6 - final 08-05-26 44-0.3--0.54-2.2 1 год ничего, 4 года - плохо
@@ -673,7 +660,7 @@ def main(maxcpus=None):
     # tf = params['tf'] = '1h'
     tf = '1h'
     # tf = params['tf'] = '1d'
-    start_date = '2025-6-20'
+    start_date = '2023-6-20'
 
     # end_date = params['end_date'] = '2026-3-17'  # datetime.today()
     end_date = datetime.today()
@@ -685,7 +672,7 @@ def main(maxcpus=None):
     # futures = ['RTS', ]
     # futures = ['SPYF', ]
 
-    sec = 'CNY'  # 'CNY' 'RTS'
+    sec = 'CNY'  # 'RTS' 'Si'  #
     total_time = _time.time()
     store = MoexStore()
     datas = list()
