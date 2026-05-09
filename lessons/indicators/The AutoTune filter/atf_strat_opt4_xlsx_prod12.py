@@ -19,16 +19,25 @@ import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 
 # =============================================================================
-# CHANGELOG prod12 vs prod11 (10-05-26)
+# CHANGELOG prod12 vs prod11 (10-05-26, ред. 11-05-26 после диагностики)
 # =============================================================================
 # (1) Адаптивный фильтр Correlation Angle, период которого равен текущему
 #     доминантному циклу (DC) AutoTune. Это убирает рассогласованность периодов
 #     и заставляет оба индикатора смотреть на одну и ту же волну.
+#     ВАЖНО: DC передаётся в индикатор ПОЗИЦИОННО (вторым аргументом), иначе
+#     backtrader не отслеживает minperiod-зависимость и индикатор получает
+#     мусор на вход.
 #
-# (2) Фильтр согласия фаз: лонг разрешён только при state==0 и угле в восходящей
-#     полусфере (-180..0), шорт — при state==0 и угле в нисходящей (0..+180).
-#     Флаг use_corr_angle_filter позволяет включать/отключать фильтр для
-#     честного A/B-сравнения на одних и тех же данных.
+# (2) Фильтр согласия фаз с тремя режимами:
+#       'off'       — фильтр выключен (= prod11);
+#       'direction' — только направление угла (восходящая/нисходящая полусфера);
+#       'state'     — только state==0 (циклический режим);
+#       'both'      — обе проверки.
+#     Дефолт 'direction'. State исключён из дефолта, потому что после wraparound
+#     фазы (+180 -> -180) он ложно срабатывает как тренд и режет именно те
+#     моменты, когда AutoTune даёт сигнал на впадине цикла.
+#     Граничные условия по углу — нестрогие (-180 и +180 включены), потому
+#     что на cross_up впадины цикла угол часто оказывается ровно -180.
 #
 # (3) Управление стопом и выходом перестроено:
 #       - стоп-лосс = entry ± stop_dc_mult * DC * ATR (динамически по циклу
@@ -40,7 +49,14 @@ from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 #       - фиксированный тейк-профит (tp_mult) удалён как структурно
 #         несовместимый с mean-reversion-логикой.
 #
-# Удалённые параметры:  tp_mult.
+# (4) Диагностические счётчики (diag_print_filter_stats=True):
+#     на stop() стратегии печатаются разрезы прохождения сигналов через
+#     каждый этап фильтрации — сколько было базовых сигналов AutoTune, сколько
+#     отрезал Correlation Angle, сколько провалилось на расчёте размера,
+#     сколько стало сделок. Помогает быстро понять, кто кого режет.
+#
+# Удалённые параметры:  tp_mult, use_corr_angle_filter (заменён на
+#                       corr_filter_mode).
 # Удалённые классы:     AllInSizer (расчёт размера переехал в стратегию).
 # Прежние фильтры min_dc, max_adx сохранены без изменений.
 # =============================================================================
@@ -279,9 +295,13 @@ class CorrelationAngleAdaptive(bt.Indicator):
     John Ehlers - Correlation Angle, адаптивная версия.
 
     В отличие от стандартной демки, период корреляции на каждом баре равен
-    текущему доминантному циклу AutoTune (DC), переданному через параметр
-    dc_line. Это убирает рассогласованность периодов между двумя индикаторами:
-    оба смотрят на одну и ту же волну.
+    текущему доминантному циклу AutoTune (DC), переданному ВТОРЫМ позиционным
+    аргументом. Позиционная передача обязательна — иначе backtrader не
+    отслеживает minperiod-зависимость и не гарантирует, что DC будет
+    рассчитан до этого индикатора.
+
+    Использование:
+        self.corr = CorrelationAngleAdaptive(self.data.close, self.atf.dc)
 
     Линии:
     - real, imag : корреляции с Cosine и -Sine соответственно;
@@ -289,7 +309,6 @@ class CorrelationAngleAdaptive(bt.Indicator):
     - state      : 0 = cycle mode, 1 = trend up, -1 = trend down.
 
     Параметры:
-    - dc_line          : линия доминантного цикла (например, self.atf.dc);
     - max_period       : верхняя граница окна корреляции; задаёт minperiod
                          индикатора (нужно достаточно баров истории);
     - min_period       : нижняя граница для защиты от слишком коротких циклов;
@@ -299,7 +318,6 @@ class CorrelationAngleAdaptive(bt.Indicator):
     lines = ('real', 'imag', 'angle', 'state')
 
     params = (
-        ('dc_line', None),
         ('max_period', 80),
         ('min_period', 6),
         ('trend_threshold', 9.0),
@@ -316,8 +334,6 @@ class CorrelationAngleAdaptive(bt.Indicator):
     )
 
     def __init__(self):
-        if self.p.dc_line is None:
-            raise ValueError('CorrelationAngleAdaptive: параметр dc_line обязателен')
         if self.p.max_period < 2:
             raise ValueError('CorrelationAngleAdaptive: max_period должен быть >= 2')
         # Достаточно памяти для самой длинной возможной корреляции
@@ -335,7 +351,7 @@ class CorrelationAngleAdaptive(bt.Indicator):
         return value
 
     def _correlate_with_wave(self, period, wave_func, fallback):
-        """Pearson correlation между Price и заданной волной wave_func."""
+        """Pearson correlation между Price (data) и заданной волной wave_func."""
         sx = sy = sxx = sxy = syy = 0.0
         for count in range(1, period + 1):
             bars_ago = count - 1
@@ -354,8 +370,9 @@ class CorrelationAngleAdaptive(bt.Indicator):
         return self._safe(corr, fallback)
 
     def next(self):
-        # Берём текущий DC и приводим его к допустимому диапазону окна
-        dc_now = self._safe(self.p.dc_line[0], self.p.min_period)
+        # DC передан вторым позиционным аргументом — backtrader отслеживает
+        # его minperiod-зависимость, поэтому к этому моменту DC уже посчитан.
+        dc_now = self._safe(self.data1[0], self.p.min_period)
         period = max(int(self.p.min_period),
                      min(int(self.p.max_period), int(round(dc_now))))
 
@@ -435,10 +452,19 @@ class AutoTuneFilterStrategy(bt.Strategy):
         max_adx=999,                  # максимальный ADX(14) для входа
 
         # === (prod12) Correlation Angle filter ===
-        use_corr_angle_filter=True,   # включает фильтр согласия фаз
-        corr_max_period=80,           # верхняя граница окна корреляции
-        corr_min_period=6,            # нижняя граница окна корреляции
-        corr_trend_threshold=9.0,     # порог Эрлерса (9° = 40-баровый цикл)
+        # Режимы фильтра согласия фаз:
+        #   'off'       — фильтр выключен (поведение как в prod11);
+        #   'direction' — только направление угла должно совпадать с
+        #                 направлением сигнала AutoTune;
+        #   'state'     — только state==0 (циклический режим);
+        #   'both'      — обе проверки (state==0 И направление совпадает).
+        # Дефолт 'direction' — компромисс: state выкинут, потому что после
+        # wraparound фазы (+180 -> -180) он ложно срабатывает как тренд и
+        # режет ровно те моменты, ради которых фильтр и нужен.
+        corr_filter_mode='direction',
+        corr_max_period=80,
+        corr_min_period=6,
+        corr_trend_threshold=9.0,
 
         # === (prod12) Управление стопом и выходом ===
         stop_atr_period=14,           # период ATR
@@ -446,6 +472,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
         time_exit_dc_mult=0.75,       # time-exit через time_exit_dc_mult*DC баров;
                                       #   0 или None отключает time-exit
         exit_on_opposite_signal=True, # выход по противоположному сигналу AutoTune
+
+        # === (prod12) Диагностика ===
+        # Если True — на stop() стратегии печатаются счётчики прохождения
+        # сигналов через каждый этап фильтрации. Очень полезно, когда сделок
+        # подозрительно мало. На оптимизацию не влияет (только output).
+        diag_print_filter_stats=False,
     )
 
     def log(self, txt):
@@ -467,11 +499,13 @@ class AutoTuneFilterStrategy(bt.Strategy):
         # ATR для динамического стопа
         self.atr = bt.indicators.ATR(self.data, period=int(self.p.stop_atr_period))
 
-        # Correlation Angle с DC от AutoTune (всегда вычисляется,
-        # применяется в зависимости от use_corr_angle_filter)
+        # Correlation Angle с DC от AutoTune.
+        # КРИТИЧНО: DC передаётся ПОЗИЦИОННО (вторым аргументом), иначе
+        # backtrader не отслеживает minperiod-зависимость и индикатор может
+        # считаться раньше, чем DC рассчитан — на выходе будет мусор.
         self.corr = CorrelationAngleAdaptive(
             self.data.close,
-            dc_line=self.atf.dc,
+            self.atf.dc,
             max_period=int(self.p.corr_max_period),
             min_period=int(self.p.corr_min_period),
             trend_threshold=float(self.p.corr_trend_threshold),
@@ -500,11 +534,50 @@ class AutoTuneFilterStrategy(bt.Strategy):
         # Состояние сделки
         self.entry_order = None
         self.stop_order = None
+        self.close_order = None  # ордер, отправленный через _close_position_by_signal
         self.entry_price = 0.0
         self.stop_loss_price = 0.0
         self.entry_bar = 0
         self.entry_dc = 0.0
         self.entry_isbuy = None  # True для long, False для short
+        # Причина выхода из текущей сделки. Устанавливается перед закрытием
+        # и используется в notify_trade(), который backtrader вызывает после
+        # notify_order(). НЕ обнуляется в _reset_state — иначе теряется к
+        # моменту notify_trade. Обнуляется только при открытии нового входа.
+        self._last_exit_reason = None
+
+        # === Диагностические счётчики прохождения через фильтры ===
+        # Считаем сигналы базы AutoTune (cross_up + mincorr<thresh + min_dc + max_adx)
+        # и далее — куда они девались.
+        self._diag = dict(
+            base_long=0,
+            base_short=0,
+            ca_rejected_long=0,
+            ca_rejected_short=0,
+            entry_calc_failed_long=0,
+            entry_calc_failed_short=0,
+            entries_long=0,
+            entries_short=0,
+            # === Разрез по типу выхода (заполняется в notify_trade) ===
+            exit_time=0,
+            exit_opposite=0,
+            exit_stop=0,
+            exit_unknown=0,
+            pnl_time=0.0,
+            pnl_opposite=0.0,
+            pnl_stop=0.0,
+            pnl_unknown=0.0,
+            bars_held_sum=0,
+            bars_held_count=0,
+            # === Контекст входа (заполняется в _submit_entry_with_params) ===
+            dc_at_entry_sum=0.0,
+            atr_at_entry_sum=0.0,
+            stop_dist_sum=0.0,
+            # === Отказы ордеров (заполняется в notify_order) ===
+            rejected_entry=0,
+            rejected_stop=0,
+            rejected_close=0,
+        )
 
     # -------------------------------------------------------------------------
     # Применение фильтра согласия фаз (prod12)
@@ -512,21 +585,43 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
     def _phase_allows_long(self):
         """True, если Correlation Angle подтверждает направление long."""
-        if not self.p.use_corr_angle_filter:
+        mode = self.p.corr_filter_mode
+        if mode == 'off':
             return True
-        if int(round(self.corr.state[0])) != 0:
-            return False  # трендовый режим — не входим
-        # Восходящая фаза: angle в (-180, 0)
-        return -180.0 < self.corr.angle[0] < 0.0
+
+        state_ok = int(round(self.corr.state[0])) == 0
+        # Восходящая фаза: angle в [-180, 0]. Нестрогие границы — потому что
+        # на cross_up впадины цикла угол часто оказывается ровно -180.
+        angle = self.corr.angle[0]
+        direction_ok = -180.0 <= angle <= 0.0
+
+        if mode == 'state':
+            return state_ok
+        if mode == 'direction':
+            return direction_ok
+        if mode == 'both':
+            return state_ok and direction_ok
+        # Неизвестный режим — fail-safe в сторону пропуска
+        return True
 
     def _phase_allows_short(self):
         """True, если Correlation Angle подтверждает направление short."""
-        if not self.p.use_corr_angle_filter:
+        mode = self.p.corr_filter_mode
+        if mode == 'off':
             return True
-        if int(round(self.corr.state[0])) != 0:
-            return False
-        # Нисходящая фаза: angle в [0, 180)
-        return 0.0 <= self.corr.angle[0] < 180.0
+
+        state_ok = int(round(self.corr.state[0])) == 0
+        # Нисходящая фаза: angle в [0, 180]. Нестрогие границы.
+        angle = self.corr.angle[0]
+        direction_ok = 0.0 <= angle <= 180.0
+
+        if mode == 'state':
+            return state_ok
+        if mode == 'direction':
+            return direction_ok
+        if mode == 'both':
+            return state_ok and direction_ok
+        return True
 
     # -------------------------------------------------------------------------
     # Расчёт стоп-лосса и размера позиции (prod12)
@@ -596,16 +691,15 @@ class AutoTuneFilterStrategy(bt.Strategy):
     def _reset_state(self):
         self.entry_order = None
         self.stop_order = None
+        self.close_order = None
         self.entry_price = 0.0
         self.stop_loss_price = 0.0
         self.entry_bar = 0
         self.entry_dc = 0.0
         self.entry_isbuy = None
 
-    def _submit_entry(self, isbuy):
-        params = self._calc_entry_params(isbuy)
-        if params is None:
-            return
+    def _submit_entry_with_params(self, isbuy, params):
+        """Отправляет ордер на вход с уже рассчитанными параметрами."""
         size, entry_price, stop_price = params
 
         side = 'long' if isbuy else 'short'
@@ -617,12 +711,21 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.entry_isbuy = isbuy
         self.entry_dc = float(self.atf.dc[0])
 
+        # Новый вход — обнуляем причину выхода из предыдущей сделки
+        self._last_exit_reason = None
+
+        # Контекст входа для усреднений в diag-выводе
+        self._diag['dc_at_entry_sum'] += self.entry_dc
+        self._diag['atr_at_entry_sum'] += float(self.atr[0])
+        self._diag['stop_dist_sum'] += abs(entry_price - stop_price)
+
         method = self.buy if isbuy else self.sell
-        self.entry_order = method(
-            size=size,
-            exectype=bt.Order.Market,
-            oargs={'name': side},
-        )
+        # Имя пишем через addinfo, а не через oargs:
+        # oargs работает только в buy_bracket/sell_bracket, для простых
+        # buy/sell оно молча игнорируется и order.info.name остаётся пустым.
+        order = method(size=size, exectype=bt.Order.Market)
+        order.addinfo(name=side)
+        self.entry_order = order
 
     def _submit_stop_after_fill(self, executed_price):
         """Выставляет защитный стоп после исполнения входного ордера."""
@@ -644,20 +747,44 @@ class AutoTuneFilterStrategy(bt.Strategy):
         # Стоп-ордер на закрытие позиции: для long — sell stop, для short — buy stop
         size = abs(self.position.size)
         stop_method = self.sell if isbuy else self.buy
-        self.stop_order = stop_method(
+        order = stop_method(
             size=size,
             exectype=bt.Order.Stop,
             price=self.stop_loss_price,
-            oargs={'name': 'stop_loss'},
         )
+        order.addinfo(name='stop_loss')
+        self.stop_order = order
         self.log(f'STOP placed at {self.stop_loss_price:.4f}')
 
-    def _close_position_by_signal(self, reason):
-        """Закрытие позиции рыночным ордером, отмена защитного стопа."""
+    def _close_position_by_signal(self, reason_type, reason_detail=''):
+        """
+        Закрытие позиции рыночным ордером, отмена защитного стопа.
+
+        reason_type: 'time' | 'opposite' — для счётчиков диагностики.
+
+        Закрытие отправляется явным sell/buy с name='close_signal', чтобы
+        notify_order мог отличить его от срабатывания стопа и от обычного
+        входного ордера. self.close() не используется, потому что у созданного
+        им ордера нет name в info, и он попадает в общую else-ветку.
+        """
+        # Защита от race condition: если стоп успел сработать в тот же момент,
+        # позиция уже 0 — ничего закрывать не нужно.
+        if self.position.size == 0:
+            return
+
+        self._last_exit_reason = reason_type
         if self.stop_order is not None and self.stop_order.alive():
             self.cancel(self.stop_order)
-        self.log(f'CLOSE by {reason} at close={self.data.close[0]:.4f}')
-        self.close()
+
+        full_reason = f'{reason_type} ({reason_detail})' if reason_detail else reason_type
+        self.log(f'CLOSE by {full_reason} at close={self.data.close[0]:.4f}')
+
+        size = abs(self.position.size)
+        # Для long-позиции закрываем sell; для short — buy.
+        method = self.sell if self.position.size > 0 else self.buy
+        order = method(size=size, exectype=bt.Order.Market)
+        order.addinfo(name='close_signal')
+        self.close_order = order
 
     # -------------------------------------------------------------------------
     # Колбэки
@@ -667,29 +794,74 @@ class AutoTuneFilterStrategy(bt.Strategy):
         if order.status in [order.Submitted, order.Accepted]:
             return
 
-        order_name = getattr(order.info, 'name', None)
+        # Идентификация ордера ПО ОБЪЕКТУ, а не по order.info.name.
+        # Это надёжно: даже если addinfo по какой-то причине не сработает,
+        # сравнение `order is self.entry_order` всегда даст правильный ответ.
+        # name (если есть) используется только для логов.
+        order_name = getattr(order.info, 'name', None) or '?'
+        is_entry = (order is self.entry_order)
+        is_stop = (order is self.stop_order)
+        is_close = (order is self.close_order)
 
         if order.status == order.Completed:
-            if order_name in ('long', 'short'):
+            if is_entry:
                 self.log(f'ENTRY {order_name.upper()} EXECUTED at {order.executed.price:.4f}')
                 self.entry_price = order.executed.price
                 self.entry_bar = len(self)
+                self.entry_order = None
                 # Выставляем защитный стоп
                 self._submit_stop_after_fill(order.executed.price)
-                self.entry_order = None
-            elif order_name == 'stop_loss':
+            elif is_stop:
                 self.log(f'STOP LOSS HIT at {order.executed.price:.4f}')
+                # Причина выхода — для notify_trade. Должна быть установлена
+                # ДО _reset_state, потому что notify_trade приходит после
+                # notify_order и читает self._last_exit_reason.
+                self._last_exit_reason = 'stop'
+                self._reset_state()
+            elif is_close:
+                self.log(f'CLOSE EXECUTED at {order.executed.price:.4f}')
+                # _last_exit_reason уже выставлен в _close_position_by_signal
                 self._reset_state()
             else:
-                # Закрытие по сигналу (без явного name) — close()
-                self.log(f'POSITION CLOSED at {order.executed.price:.4f}')
-                self._reset_state()
+                # Сюда попадаем, если ордер не один из наших — теоретически
+                # такого не должно быть. НЕ сбрасываем состояние, чтобы не
+                # сломать отслеживание реальных ордеров.
+                self.log(f'WARNING: completed UNKNOWN order at '
+                         f'{order.executed.price:.4f} (name={order_name!r})')
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'ORDER {order_name} FAILED: {order.getstatusname()}')
-            if order_name in ('long', 'short'):
+            if is_entry:
+                self._diag['rejected_entry'] += 1
                 self._reset_state()
-            elif order_name == 'stop_loss':
+            elif is_stop:
+                # Cancel ожидаем (мы сами отменяем стоп при close-by-signal),
+                # это не ошибка. Margin/Rejected — это плохо: позиция останется
+                # без стопа. Отдельно считаем только реальные отказы.
+                if order.status != order.Canceled:
+                    self._diag['rejected_stop'] += 1
                 self.stop_order = None
+            elif is_close:
+                self._diag['rejected_close'] += 1
+                self.close_order = None
+                # Позиция всё ещё открыта; на следующем баре next() снова
+                # попытается закрыть. _last_exit_reason сохраняется.
+
+    def notify_trade(self, trade):
+        """
+        Учёт закрытых сделок в разрезе по причине выхода. Выполняется ПОСЛЕ
+        notify_order, поэтому self._last_exit_reason к этому моменту уже
+        содержит правильное значение ('time' / 'opposite' / 'stop').
+        """
+        if not trade.isclosed:
+            return
+        reason = self._last_exit_reason or 'unknown'
+        # Защита от опечаток / неожиданных значений
+        if reason not in ('time', 'opposite', 'stop'):
+            reason = 'unknown'
+        self._diag[f'exit_{reason}'] += 1
+        self._diag[f'pnl_{reason}'] += trade.pnlcomm
+        self._diag['bars_held_sum'] += trade.barlen
+        self._diag['bars_held_count'] += 1
 
     def next(self):
         # Если есть позиция — следим за условиями выхода
@@ -699,15 +871,15 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 bars_held = len(self) - self.entry_bar
                 max_bars = int(self.p.time_exit_dc_mult * self.entry_dc)
                 if max_bars > 0 and bars_held >= max_bars:
-                    self._close_position_by_signal(reason=f'time-exit ({bars_held} bars)')
+                    self._close_position_by_signal('time', f'{bars_held} bars')
                     return
             # Выход по противоположному сигналу AutoTune
             if self.p.exit_on_opposite_signal:
                 if self.entry_isbuy is True and self.cross_down[0]:
-                    self._close_position_by_signal(reason='opposite signal (cross_down)')
+                    self._close_position_by_signal('opposite', 'cross_down')
                     return
                 if self.entry_isbuy is False and self.cross_up[0]:
-                    self._close_position_by_signal(reason='opposite signal (cross_up)')
+                    self._close_position_by_signal('opposite', 'cross_up')
                     return
             return  # пока в позиции — новых входов не делаем
 
@@ -715,10 +887,131 @@ class AutoTuneFilterStrategy(bt.Strategy):
         if self._is_busy():
             return
 
-        if self._long_base[0] and self._phase_allows_long():
-            self._submit_entry(isbuy=True)
-        elif self.p.allow_short and self._short_base[0] and self._phase_allows_short():
-            self._submit_entry(isbuy=False)
+        # Базовые сигналы AutoTune (cross + mincorr<thresh + min_dc + max_adx)
+        long_base = bool(self._long_base[0])
+        short_base = bool(self.p.allow_short and self._short_base[0])
+
+        if long_base:
+            self._diag['base_long'] += 1
+            if not self._phase_allows_long():
+                self._diag['ca_rejected_long'] += 1
+            else:
+                # Прошёл фильтр Correlation Angle — пробуем рассчитать вход
+                params = self._calc_entry_params(isbuy=True)
+                if params is None:
+                    self._diag['entry_calc_failed_long'] += 1
+                else:
+                    self._diag['entries_long'] += 1
+                    self._submit_entry_with_params(isbuy=True, params=params)
+                    return
+
+        if short_base:
+            self._diag['base_short'] += 1
+            if not self._phase_allows_short():
+                self._diag['ca_rejected_short'] += 1
+            else:
+                params = self._calc_entry_params(isbuy=False)
+                if params is None:
+                    self._diag['entry_calc_failed_short'] += 1
+                else:
+                    self._diag['entries_short'] += 1
+                    self._submit_entry_with_params(isbuy=False, params=params)
+
+    def stop(self):
+        """Печать диагностических счётчиков по фильтрам."""
+        if not self.p.diag_print_filter_stats:
+            return
+
+        # Открытая позиция в конце бэктеста — явный признак, что exit-логика
+        # не сработала. Это сразу видно глазами в логе и позволяет не гадать,
+        # «реально 0 сделок или просто все висят открытыми».
+        if self.position:
+            print(
+                f'[DIAG {self.data._name}] WARNING: позиция ОТКРЫТА в конце '
+                f'бэктеста, size={self.position.size}, '
+                f'entry_isbuy={self.entry_isbuy}, entry_dc={self.entry_dc:.1f}, '
+                f'entry_bar={self.entry_bar}, last_bar={len(self)}. '
+                f'Это значит, что ни stop, ни time-exit, ни opposite-signal '
+                f'не сработали — копайте логи notify_order.'
+            )
+        d = self._diag
+        total_base = d['base_long'] + d['base_short']
+        total_entries = d['entries_long'] + d['entries_short']
+        total_ca_rej = d['ca_rejected_long'] + d['ca_rejected_short']
+        total_calc_fail = d['entry_calc_failed_long'] + d['entry_calc_failed_short']
+
+        # Не засоряем вывод, если стратегия совсем не активировалась
+        if total_base == 0:
+            print(
+                f'[DIAG {self.data._name}] base_signals=0 — '
+                f'AutoTune не выдал ни одного сигнала. '
+                f'Проверьте window/bandwidth/thresh/min_dc/max_adx, '
+                f'возможно условия слишком жёсткие.'
+            )
+            return
+
+        print(
+            f'[DIAG {self.data._name}] '
+            f'mode={self.p.corr_filter_mode} | '
+            f'base={total_base} (L={d["base_long"]}, S={d["base_short"]}) -> '
+            f'CA_rejected={total_ca_rej} (L={d["ca_rejected_long"]}, S={d["ca_rejected_short"]}), '
+            f'calc_failed={total_calc_fail} -> '
+            f'entries={total_entries} (L={d["entries_long"]}, S={d["entries_short"]})'
+        )
+
+        # === Разрез по типу выхода ===
+        total_exits = (d['exit_time'] + d['exit_opposite']
+                       + d['exit_stop'] + d['exit_unknown'])
+        if total_exits > 0:
+            avg_bars = (d['bars_held_sum'] / d['bars_held_count']
+                        if d['bars_held_count'] else 0.0)
+
+            def _fmt_exit(name, key):
+                cnt = d[f'exit_{key}']
+                if cnt == 0:
+                    return f'{name}=0'
+                pnl = d[f'pnl_{key}']
+                avg = pnl / cnt
+                return f'{name}={cnt} (PnL={pnl:+.0f}, avg={avg:+.0f})'
+
+            unknown_part = ''
+            if d['exit_unknown']:
+                unknown_part = ', ' + _fmt_exit('unknown', 'unknown')
+
+            print(
+                f'  exits: {_fmt_exit("time", "time")}, '
+                f'{_fmt_exit("opposite", "opposite")}, '
+                f'{_fmt_exit("stop", "stop")}'
+                f'{unknown_part} | '
+                f'avg_bars_held={avg_bars:.1f}'
+            )
+
+        # === Контекст входа (средние DC, ATR, stop_distance) ===
+        if total_entries > 0:
+            avg_dc = d['dc_at_entry_sum'] / total_entries
+            avg_atr = d['atr_at_entry_sum'] / total_entries
+            avg_stop = d['stop_dist_sum'] / total_entries
+            # Ожидаемый time-exit при средних DC и текущем коэффициенте
+            expected_max_bars = int(self.p.time_exit_dc_mult * avg_dc) \
+                if self.p.time_exit_dc_mult else 0
+            print(
+                f'  entry context: avg_DC={avg_dc:.1f}, avg_ATR={avg_atr:.4f}, '
+                f'avg_stop_dist={avg_stop:.4f} '
+                f'(=stop_dc_mult*DC*ATR), '
+                f'expected_time_exit={expected_max_bars} bars'
+            )
+
+        # === Отказы ордеров (если есть) ===
+        total_rejected = (d['rejected_entry'] + d['rejected_stop']
+                          + d['rejected_close'])
+        if total_rejected > 0:
+            print(
+                f'  REJECTED orders: '
+                f'entry={d["rejected_entry"]}, '
+                f'stop={d["rejected_stop"]}, '
+                f'close={d["rejected_close"]} '
+                f'-- ВНИМАНИЕ: проверьте checksubmit=False у broker.'
+            )
 
 
 # =============================================================================
@@ -728,8 +1021,9 @@ class AutoTuneFilterStrategy(bt.Strategy):
 def main(maxcpus=None):
     start_cash = 300000.0
 
-    # Дефолтный набор: фильтры включены, ATR-стоп и выход по сигналу активны.
-    # Для оптимизации — заменяйте отдельные значения на range/list.
+    # Дефолтный набор: фильтр в режиме 'direction' (компромиссный),
+    # ATR-стоп и выход по сигналу активны, диагностика включена,
+    # чтобы при подозрительно малом числе сделок видеть, кто кого режет.
     params = dict(  # CNY_1h - стартовый набор для prod12
         write_history=True,
         risk=5,
@@ -744,7 +1038,9 @@ def main(maxcpus=None):
         max_adx=999,
 
         # === Correlation Angle filter (prod12) ===
-        use_corr_angle_filter=False,    # для A/B-сравнения можно [True, False]
+        # Режимы: 'off', 'direction', 'state', 'both'.
+        # Для A/B-сравнения можно: corr_filter_mode=['off', 'direction', 'both']
+        corr_filter_mode='direction',
         corr_max_period=80,
         corr_min_period=6,
         corr_trend_threshold=9.0,
@@ -752,12 +1048,18 @@ def main(maxcpus=None):
         # === ATR-стоп и выход (prod12) ===
         stop_atr_period=14,
         stop_dc_mult=0.4,              # для оптимизации: [i/10 for i in range(3, 9)]
-        time_exit_dc_mult=0,  #0.75,        # 0 отключает time-exit
-        exit_on_opposite_signal=False,
+        time_exit_dc_mult=0.75,        # 0 отключает time-exit
+        exit_on_opposite_signal=True,
+
+        # === Диагностика ===
+        # На stop() стратегии печатается, сколько базовых сигналов AutoTune
+        # было, сколько отрезано Correlation Angle, сколько провалилось на
+        # расчёте размера, и сколько в итоге стало сделок.
+        diag_print_filter_stats=True,
     )
 
     tf = '1h'
-    start_date = '2025-6-20'
+    start_date = '2023-6-20'
     end_date = datetime.today()
     main_opt_metric = 'PROM'
 
@@ -800,7 +1102,13 @@ def main(maxcpus=None):
         analyzer_params['asset'] = data.sec
         st_time = _time.time()
         cerebro = bt.Cerebro()
-        cerebro.broker = bt.brokers.BackBroker()
+        # ВАЖНО: checksubmit=False отключает pre-submit margin-check у BackBroker.
+        # Без этого закрывающие ордера (стопы и close-by-signal) часто
+        # отвергаются с Margin-статусом, потому что брокер видит каждый ордер
+        # как независимый и проверяет margin как для нового открытия позиции.
+        # В prod11 эта проблема обходилась через `_checksubmit=False` на
+        # bracket children. Здесь мы делаем то же самое глобально.
+        cerebro.broker = bt.brokers.BackBroker(checksubmit=False)
         cerebro.broker.setcash(start_cash)
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
         # AllInSizer убран — расчёт размера выполняется в стратегии
