@@ -8,7 +8,7 @@ import backtrader as bt
 from matplotlib.style.core import available
 from moex_store import MoexStore
 import gc
-from atf_new import AutoTuneFilter
+from atf import AutoTuneFilter
 from backtrader import Analyzer
 from math import sqrt
 import numpy as np

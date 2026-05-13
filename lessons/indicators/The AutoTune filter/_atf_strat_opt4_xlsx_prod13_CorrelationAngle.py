@@ -2,7 +2,7 @@ from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
 import os
-import re
+import math
 import time as _time
 from datetime import datetime, time, timedelta
 import backtrader as bt
@@ -19,9 +19,10 @@ from statistics import mean, stdev
 import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 
-SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
-SCRIPT_VERSION_MATCH = re.search(r'(prod\d+)', SCRIPT_NAME, re.IGNORECASE)
-SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH else SCRIPT_NAME
+# 12-05-26 prod12 = prod11 + опциональный фильтр Correlation Angle (Эрлерс).
+#           Поведение по умолчанию совпадает с prod11 (corr_filter_mode='off').
+#           Все остальные механизмы (sizer, stop+tp bracket, расчёт стопа,
+#           комиссии, аналитика) — БЕЗ изменений по сравнению с prod11.
 
 # 08-05-26 Это пока крайняя версия, новая opt5 - в тесте, версии opt_csv имеют упрощенный
 #           вывод результата и пока дальше не развиваем.
@@ -30,9 +31,7 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           - max_adx=40 означает «вход разрешён, если adx <= 40», отсекаются сделки с adx > 40.
 #           Дефлтные значения (фильтры выключены):
 #           - min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
-#           - max_adx=999,   # максимальный ADX для входа
-# 11-05-26 prod12: добавил adx_period в params, чтобы оптимизировать период ADX;
-#           имя версии prodXX теперь автоматически попадает в имя XLSX-файла.
+#           - max_adx=999,   # максимальный ADX(14) для входа
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -407,6 +406,128 @@ class SmartAnalyzer(Analyzer):
     def get_trades_pnl(self):
         return self.pt_arr + self.lt_arr
 
+class CorrelationAngleAdaptive(bt.Indicator):
+    """
+    John Ehlers - Correlation Angle, адаптивная версия.
+
+    Период корреляции на каждом баре равен текущему доминантному циклу
+    AutoTune (DC), переданному ВТОРЫМ позиционным аргументом. Позиционная
+    передача обязательна — иначе backtrader не отслеживает minperiod-
+    зависимость и индикатор может быть посчитан раньше DC.
+
+    Использование:
+        self.corr = CorrelationAngleAdaptive(self.data.close, self.atf.dc)
+
+    Линии:
+    - real, imag : корреляции с Cosine и -Sine соответственно;
+    - angle      : фазовый угол, диапазон примерно -180..+180 градусов;
+    - state      : 0 = cycle mode, 1 = trend up, -1 = trend down.
+    """
+
+    lines = ('real', 'imag', 'angle', 'state')
+
+    params = (
+        ('max_period', 80),
+        ('min_period', 6),
+        ('trend_threshold', 9.0),
+        ('eps', 1e-12),
+    )
+
+    plotinfo = dict(subplot=True, plotname='CorrAngle (adaptive)')
+
+    plotlines = dict(
+        real=dict(_name='Real / CosCorr', _plotskip=True),
+        imag=dict(_name='Imag / NegSineCorr', _plotskip=True),
+        angle=dict(_name='Phase angle'),
+        state=dict(_name='State'),
+    )
+
+    def __init__(self):
+        if self.p.max_period < 2:
+            raise ValueError('CorrelationAngleAdaptive: max_period должен быть >= 2')
+        # Достаточно памяти для самой длинной возможной корреляции
+        self.addminperiod(int(self.p.max_period))
+
+    @staticmethod
+    def _safe(value, default=0.0):
+        if value is None:
+            return default
+        try:
+            if math.isnan(value):
+                return default
+        except TypeError:
+            pass
+        return value
+
+    def _correlate_with_wave(self, period, wave_func, fallback):
+        """Pearson correlation между Price (data) и заданной волной wave_func."""
+        sx = sy = sxx = sxy = syy = 0.0
+        for count in range(1, period + 1):
+            bars_ago = count - 1
+            x = self._safe(self.data[-bars_ago], 0.0)
+            y = wave_func(bars_ago, period)
+            sx += x
+            sy += y
+            sxx += x * x
+            sxy += x * y
+            syy += y * y
+        vx = period * sxx - sx * sx
+        vy = period * syy - sy * sy
+        if vx <= self.p.eps or vy <= self.p.eps:
+            return fallback
+        corr = (period * sxy - sx * sy) / math.sqrt(vx * vy)
+        return self._safe(corr, fallback)
+
+    def next(self):
+        # DC передан вторым позиционным аргументом — backtrader отслеживает
+        # его minperiod-зависимость, поэтому к этому моменту DC уже посчитан.
+        dc_now = self._safe(self.data1[0], self.p.min_period)
+        period = max(int(self.p.min_period),
+                     min(int(self.p.max_period), int(round(dc_now))))
+
+        prev_real = self._safe(self.l.real[-1], 0.0) if len(self) > 1 else 0.0
+        prev_imag = self._safe(self.l.imag[-1], 0.0) if len(self) > 1 else 0.0
+        prev_angle = self._safe(self.l.angle[-1], 0.0) if len(self) > 1 else 0.0
+
+        # 1. Корреляция с Cosine
+        real = self._correlate_with_wave(
+            period,
+            lambda ago, T: math.cos(math.radians(360.0 * ago / T)),
+            fallback=prev_real,
+        )
+        # 2. Корреляция с -Sine
+        imag = self._correlate_with_wave(
+            period,
+            lambda ago, T: -math.sin(math.radians(360.0 * ago / T)),
+            fallback=prev_imag,
+        )
+
+        # 3. Phase angle через арктангенс с разрешением неоднозначности
+        if abs(imag) > self.p.eps:
+            angle_raw = 90.0 + math.degrees(math.atan(real / imag))
+            if imag > 0.0:
+                angle_raw -= 180.0
+        else:
+            angle_raw = prev_angle
+
+        angle = angle_raw
+
+        # 4. Anti-regression: фаза не идёт назад, кроме wraparound (+180 -> -180)
+        if len(self) > 1:
+            if (prev_angle - angle < 270.0) and (angle < prev_angle):
+                angle = prev_angle
+
+        # 5. State: если изменение фазы меньше порога — это трендовый режим
+        state = 0.0
+        if len(self) > 1 and abs(angle - prev_angle) < float(self.p.trend_threshold):
+            state = -1.0 if angle < 0.0 else 1.0
+
+        self.l.real[0] = real
+        self.l.imag[0] = imag
+        self.l.angle[0] = angle
+        self.l.state[0] = state
+
+
 class AutoTuneFilterStrategy(bt.Strategy):
     """
     Strategy based on Financial Hacker article:
@@ -414,33 +535,43 @@ class AutoTuneFilterStrategy(bt.Strategy):
     - Long  when ROC crosses above 0 and MinCorr < Thresh
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
 
-    В версии prod12 были добавлены два дополнительных фильтра входа:
+    В этой версии (prod11) добавлены два дополнительных фильтра входа:
       * min_dc  — минимальный доминирующий цикл AutoTune. Сделки с dc < min_dc
                   не открываются (короткие циклы = шум, на нём mean-reversion
                   систематически проигрывает).
-      * max_adx — максимальный ADX. Сделки при ADX > max_adx не
+      * max_adx — максимальный ADX(14). Сделки при ADX > max_adx не
                   открываются (на сильном тренде возврат к среднему ломается).
     Нейтральные дефолты (min_dc=0, max_adx=999) воспроизводят прежнее
-    поведение стратегии. В prod12 добавлен параметр adx_period для оптимизации
-    периода ADX, а не только порога max_adx.
+    поведение стратегии.
     """
 
     params = dict(
         write_history=None,  # Записываем или нет детальную инфу о каждой сделке
         risk=None,
-        window=26,
-        bandwidth=0.22,
-        thresh=-0.22,
+        window=45,
+        bandwidth=0.3,
+        thresh=-0.5,
         allow_short=True,
         printlog=False,
-        tp_mult=2.0,   # тейк-профит в R
+        tp_mult=1.5,   # тейк-профит в R
         # === Дополнительные фильтры на условие входа =========================
         # Нейтральные дефолты (фильтры выключены): min_dc=0, max_adx=999.
         # Чтобы активировать — задайте конкретные значения (например, 25 и 40
         # по результатам диагностического анализа).
         min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
-        max_adx=999,   # максимальный ADX для входа
-        adx_period=14, # период ADX для фильтра max_adx
+        max_adx=999,   # максимальный ADX(14) для входа
+        # === (prod12) Опциональный фильтр Correlation Angle (Эрлерс) =========
+        # Режимы:
+        #   'off'       — фильтр выключен (= prod11; ПОВЕДЕНИЕ ПО УМОЛЧАНИЮ);
+        #   'direction' — лонг разрешён только если фаза в восходящей
+        #                 полусфере (-180..0), шорт — в нисходящей (0..+180);
+        #   'state'     — вход разрешён только при state==0 (циклический режим);
+        #   'both'      — обе проверки сразу (state==0 И направление совпадает).
+        # Период Correlation Angle на каждом баре равен текущему DC AutoTune.
+        corr_filter_mode='off',
+        corr_max_period=80,        # верхняя граница окна корреляции
+        corr_min_period=6,         # нижняя граница окна корреляции
+        corr_trend_threshold=9.0,  # порог Эрлерса (9° = 40-баровый цикл)
     )
 
     def log(self, txt):
@@ -454,10 +585,20 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
-        # Индикатор для фильтра max_adx. В prod12 период вынесен в params,
-        # чтобы можно было оптимизировать не только порог max_adx, но и
-        # чувствительность самого ADX.
-        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
+        # Индикатор для фильтра max_adx. period=14 — стандарт.
+        self.adx = bt.indicators.ADX(self.data, period=14)
+
+        # (prod12) Correlation Angle с DC от AutoTune. Передаётся ПОЗИЦИОННО,
+        # иначе backtrader не отслеживает minperiod-зависимость.
+        # Индикатор всегда вычисляется; применяется только если
+        # corr_filter_mode != 'off'.
+        self.corr = CorrelationAngleAdaptive(
+            self.data.close,
+            self.atf.dc,
+            max_period=int(self.p.corr_max_period),
+            min_period=int(self.p.corr_min_period),
+            trend_threshold=float(self.p.corr_trend_threshold),
+        )
 
         self.stop_loss_price = 0.0
         self.entry_price = 0.0
@@ -471,7 +612,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
         #   self.atf.dc >= self.p.min_dc   -> отсекаем короткие циклы (шум)
         #   self.adx    <= self.p.max_adx  -> отсекаем сильные тренды,
         #                                     где mean-reversion ломается
-        #   self.p.adx_period влияет на сглаживание ADX.
         # При нейтральных дефолтах (min_dc=0, max_adx=999) условия истинны
         # всегда и поведение стратегии совпадает с предыдущей версией.
         self.long_signal = bt.And(
@@ -492,6 +632,44 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
+
+    # ------------------------------------------------------------------------
+    # (prod12) Применение фильтра Correlation Angle (опционально)
+    # ------------------------------------------------------------------------
+
+    def _phase_allows_long(self):
+        """True, если фильтр Correlation Angle разрешает вход в long."""
+        mode = self.p.corr_filter_mode
+        if mode == 'off':
+            return True
+        state_ok = int(round(self.corr.state[0])) == 0
+        # Восходящая фаза: angle в [-180, 0]. Нестрогие границы — потому что
+        # на cross_up впадины цикла угол часто оказывается ровно -180.
+        direction_ok = -180.0 <= self.corr.angle[0] <= 0.0
+        if mode == 'state':
+            return state_ok
+        if mode == 'direction':
+            return direction_ok
+        if mode == 'both':
+            return state_ok and direction_ok
+        # Неизвестный режим — fail-safe в сторону пропуска (как 'off')
+        return True
+
+    def _phase_allows_short(self):
+        """True, если фильтр Correlation Angle разрешает вход в short."""
+        mode = self.p.corr_filter_mode
+        if mode == 'off':
+            return True
+        state_ok = int(round(self.corr.state[0])) == 0
+        # Нисходящая фаза: angle в [0, 180]. Нестрогие границы.
+        direction_ok = 0.0 <= self.corr.angle[0] <= 180.0
+        if mode == 'state':
+            return state_ok
+        if mode == 'direction':
+            return direction_ok
+        if mode == 'both':
+            return state_ok and direction_ok
+        return True
 
     def _reset_bracket_state(self):
         self.order = None
@@ -611,9 +789,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
         if self.position or self._has_active_orders():
             return
 
-        if self.long_signal[0]:
+        # (prod12) Фильтр Correlation Angle применяется здесь и только здесь.
+        # При corr_filter_mode='off' методы _phase_allows_* всегда возвращают
+        # True, и поведение полностью совпадает с prod11.
+        if self.long_signal[0] and self._phase_allows_long():
             self._submit_bracket(isbuy=True)
-        elif self.p.allow_short and self.short_signal[0]:
+        elif self.p.allow_short and self.short_signal[0] and self._phase_allows_short():
             self._submit_bracket(isbuy=False)
 
 
@@ -625,36 +806,71 @@ def main(maxcpus=None):
     params = dict( # MIX
         write_history=True,
         risk=5,
-        window=45, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=0.25,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        window=45,
+        bandwidth=0.3,
+        thresh=-0.5,
         allow_short=True,
         printlog=False,
-        tp_mult=1.5,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-        # === Фильтры входа (prod12) ===
-        # min_dc и max_adx задают границы фильтров входа,
-        # adx_period задаёт период расчёта ADX и тоже оптимизируется.
-        # Нейтральные дефолты: min_dc=0, max_adx=999, adx_period=14.
-        # min_dc=0,
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
+        tp_mult=1.5,  #[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        # === Фильтры входа (prod11) ===
+        # Дефолты ниже — фильтры выключены; чтобы оптимизировать, замените
+        # на range или список, например: min_dc=range(20, 36, 5),
+        #                                max_adx=range(30, 51, 5),
+        min_dc=0,  # минимальный доминирующий цикл AutoTune для входа (бар)
+        max_adx=999,  # максимальный ADX(14) для входа
+        # min_dc=range(5, 22),
+        # max_adx=range(45, 72, 2),
+        # === (prod12) Фильтр Correlation Angle ===
+        # 'off' — поведение в точности как в prod11 (рекомендованный baseline).
+        # Для A/B-сравнения: corr_filter_mode=['off', 'direction', 'state', 'both']
+        # corr_filter_mode='off',
+        corr_filter_mode=['off', 'direction', 'state', 'both']
+    )
 
-        # min_dc=range(15, 36, 5),
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
-        # max_adx=999,
-        # adx_period=14,
-        #
-        min_dc=25,
-        max_adx=55,
-        adx_period=10,
+    params1 = dict(  # RTS_1h - final 08-05-26
+        write_history=True,
+        risk=5,
+        window=36,  #range(31, 44),
+        bandwidth=0.21,  #[i / 100 for i in range(19, 24)],  # [0.4, 0.45, 0.45],
+        thresh=-0.48,  #[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
+        allow_short=True,
+        tp_mult=1.2,  #[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
+        printlog=False,
+        # === Фильтры входа (prod11) ===
+        # Кандидаты по диагностическому анализу: min_dc=25, max_adx=40.
+        # Для оптимизации: min_dc=range(15, 36, 5), max_adx=range(30, 51, 5).
+        min_dc=0,
+        max_adx=999,
+    )
+
+    params1 = dict(  # SIM6 - final 08-05-26 44-0.3--0.54-2.2 1 год ничего, 4 года - плохо
+        write_history=True,
+        risk=5,
+        window=48,  #(43,44,45,47,48,49,50,51),
+        bandwidth=0.26,  #[i / 100 for i in range(24, 39, 2)], #[0.4, 0.45, 0.45],
+        thresh=-0.54,  #[-i / 100 for i in range(50, 59, 2)], #[-0.45, -0.5, -0.55],
+        allow_short=True,
+        tp_mult=2.2, #[i / 10 for i in range(20, 25)],  #[1.7, 1.8, 1.9, 2],
+        printlog=False
     )
 
 
+    # tf = params['tf'] = '15m'
+    # tf = params['tf'] = '30m'
+    # tf = params['tf'] = '1h'
     tf = '1h'
+    # tf = params['tf'] = '1d'
     start_date = '2023-6-20'
+
+    # end_date = params['end_date'] = '2026-3-17'  # datetime.today()
     end_date = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
+
+    # futures = ['RTS', 'RTSM', 'NASD', 'CNY', 'Eu', 'NG', 'GOLD', 'SBRF']
+    # futures = ['CNY', ]
+    # futures = ['Si', ]
+    # futures = ['RTS', ]
+    # futures = ['SPYF', ]
 
     sec = 'MIX'  # 'RTS' 'Si'  #
     total_time = _time.time()
@@ -762,9 +978,8 @@ def main(maxcpus=None):
     # Сохраняем штамп времени для имени XLSX-файла с результатами
     timestamp = datetime.now().strftime("%d-%m-%y %H-%M")
 
-    # Создаём имя XLSX-файла результатов. Версия берётся из имени
-    # запускаемого скрипта: например, atf_strat_opt4_xlsx_prod12.py -> prod12.
-    results_file = f'opt_results_{SCRIPT_VERSION}_{sec}_{tf}_{timestamp}.xlsx'
+    # Создаём имя XLSX-файла результатов
+    results_file = f'opt_results_prod12_{sec}_{tf}_{timestamp}.xlsx'
 
     # Записываем df в xlsx файл, xlsxwriter импортируем
     # отдельно pip install xlsxwriter
@@ -782,7 +997,7 @@ def main(maxcpus=None):
 
 if __name__ == '__main__':
     maxcpus = os.cpu_count()
-    available_cpus = maxcpus - 2
+    available_cpus = maxcpus - 3
     print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
     main(available_cpus)
 

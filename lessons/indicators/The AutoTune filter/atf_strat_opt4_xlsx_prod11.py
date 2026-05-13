@@ -8,7 +8,7 @@ import backtrader as bt
 from matplotlib.style.core import available
 from moex_store import MoexStore
 import gc
-from atf_new import AutoTuneFilter
+from atf import AutoTuneFilter
 from backtrader import Analyzer
 from math import sqrt
 import numpy as np
@@ -610,21 +610,42 @@ def main(maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     start_cash = 300000.0
 
-    params = dict( # CNY_1h - final 07-05-26
+    params = dict( # MIX
         write_history=True,
         risk=5,
-        window=28,  #[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=0.46,  #[i / 100 for i in range(43, 48)], #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=-0.68,  #[-i / 100 for i in range(65, 86)],  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        window=range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=[-i / 100 for i in range(30, 51, 10)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
-        tp_mult=1.8,  #[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        tp_mult=1.5,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
         # === Фильтры входа (prod11) ===
         # Дефолты ниже — фильтры выключены; чтобы оптимизировать, замените
         # на range или список, например: min_dc=range(20, 36, 5),
         #                                max_adx=range(30, 51, 5),
-        min_dc=range(5, 22),
-        max_adx=range(45, 72, 2),
+        min_dc=0,
+        max_adx=999,
+        # min_dc=range(5, 26, 5),
+        # max_adx=range(45, 81, 5),
+    )
+
+    params1 = dict( # CNY_1h - final 07-05-26
+        write_history=True,
+        risk=5,
+        window=28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=0.45,  #[0.43, 0.45, 0.47], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        allow_short=True,
+        printlog=False,
+        tp_mult=1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        # === Фильтры входа (prod11) ===
+        # Дефолты ниже — фильтры выключены; чтобы оптимизировать, замените
+        # на range или список, например: min_dc=range(20, 36, 5),
+        #                                max_adx=range(30, 51, 5),
+        # min_dc=0,
+        # max_adx=999,
+        min_dc=range(5, 26, 5),
+        max_adx=range(45, 81, 5),
     )
 
     params1 = dict(  # RTS_1h - final 08-05-26
@@ -672,7 +693,7 @@ def main(maxcpus=None):
     # futures = ['RTS', ]
     # futures = ['SPYF', ]
 
-    sec = 'CNY'  # 'RTS' 'Si'  #
+    sec = 'MIX'  # 'RTS' 'Si'  #
     total_time = _time.time()
     store = MoexStore()
     datas = list()
@@ -797,7 +818,7 @@ def main(maxcpus=None):
 
 if __name__ == '__main__':
     maxcpus = os.cpu_count()
-    available_cpus = maxcpus - 3
+    available_cpus = maxcpus - 2
     print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
     main(available_cpus)
 

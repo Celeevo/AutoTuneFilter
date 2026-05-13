@@ -99,9 +99,10 @@ futures_comm = dict( # Комиссии для фьючерсов
                           mult=9.8/0.1,  # мультипликатор
                           moexcomm=FUTURE_TYPE['commodity']),
     SBRF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5200,  # ГО
+                          margin=4878.91 ,  # ГО 11-05-26
                           mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['stock']),
+                          moexcomm=FUTURE_TYPE['stock'],
+                          cost_of_price_step=1),
     BR=FuturesCommission(commission=2.0,  # 2 руб за контракт
                          margin=10374,  # ГО 30-12-24
                          mult=10.167/ 0.01,  # мультипликатор
@@ -116,9 +117,9 @@ futures_comm = dict( # Комиссии для фьючерсов
                           mult=0.5 / 0.05,  # мультипликатор Стоимость шага цены/Шаг цены
                           moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05),
     SPYF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5600,  # ГО 27-04-25
-                          mult=0.82655 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05))
+                          margin=4252.12 ,  # ГО 11-05-26
+                          mult=0.83563 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
+                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.01))
 
 def round_to_nearest_price_step(step, value, isbuy):
     """
@@ -439,8 +440,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
         # Чтобы активировать — задайте конкретные значения (например, 25 и 40
         # по результатам диагностического анализа).
         min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
-        max_adx=999,   # максимальный ADX для входа
-        adx_period=14, # период ADX для фильтра max_adx
     )
 
     def log(self, txt):
@@ -454,10 +453,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
-        # Индикатор для фильтра max_adx. В prod12 период вынесен в params,
-        # чтобы можно было оптимизировать не только порог max_adx, но и
-        # чувствительность самого ADX.
-        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
 
         self.stop_loss_price = 0.0
         self.entry_price = 0.0
@@ -469,16 +464,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
         # Базовые условия входа из статьи + два дополнительных фильтра:
         #   self.atf.dc >= self.p.min_dc   -> отсекаем короткие циклы (шум)
-        #   self.adx    <= self.p.max_adx  -> отсекаем сильные тренды,
-        #                                     где mean-reversion ломается
-        #   self.p.adx_period влияет на сглаживание ADX.
-        # При нейтральных дефолтах (min_dc=0, max_adx=999) условия истинны
+        # При нейтральных дефолтах (min_dc=0) условия истинны
         # всегда и поведение стратегии совпадает с предыдущей версией.
         self.long_signal = bt.And(
             self.cross_up,
             self.atf.mincorr < self.p.thresh,
             self.atf.dc >= self.p.min_dc,
-            self.adx <= self.p.max_adx,
         )
 
         self.short_signal = bt.And(
@@ -486,7 +477,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
             self.atf.mincorr < self.p.thresh,
             self.atf.filt > 0,
             self.atf.dc >= self.p.min_dc,
-            self.adx <= self.p.max_adx,
         )
 
         self.order = None
@@ -630,33 +620,17 @@ def main(maxcpus=None):
         thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
-        tp_mult=1.5,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-        # === Фильтры входа (prod12) ===
-        # min_dc и max_adx задают границы фильтров входа,
-        # adx_period задаёт период расчёта ADX и тоже оптимизируется.
-        # Нейтральные дефолты: min_dc=0, max_adx=999, adx_period=14.
-        # min_dc=0,
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
-
-        # min_dc=range(15, 36, 5),
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
-        # max_adx=999,
-        # adx_period=14,
-        #
+        tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
         min_dc=25,
-        max_adx=55,
-        adx_period=10,
     )
 
-
     tf = '1h'
+    # start_date = '2023-6-20'
     start_date = '2023-6-20'
     end_date = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
 
-    sec = 'MIX'  # 'RTS' 'Si'  #
+    sec = 'MIX'  #'SPYF'  #'MIX'  # 'RTS' 'Si'  'SBRF'#
     total_time = _time.time()
     store = MoexStore()
     datas = list()
@@ -789,6 +763,18 @@ if __name__ == '__main__':
 
 # -------------------------------------------------------
 '''
+    params = dict( # MIX
+        write_history=True,
+        risk=5,
+        window=45, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=0.25,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        allow_short=True,
+        printlog=False,
+        tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        min_dc=25,
+    )
+    
     params = dict( # CNY_1h - final 07-05-26, для 1 год - хорошо, для 4 - плохо!
         write_history=True,
         risk=5,

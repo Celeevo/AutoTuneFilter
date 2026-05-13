@@ -33,6 +33,8 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           - max_adx=999,   # максимальный ADX для входа
 # 11-05-26 prod12: добавил adx_period в params, чтобы оптимизировать период ADX;
 #           имя версии prodXX теперь автоматически попадает в имя XLSX-файла.
+# 13-05-26 prod14: вместо bracket-выхода stop-loss + take-profit в R реализован
+#           выход по chandelier trailing-stop + reverse Donchian.
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -99,9 +101,10 @@ futures_comm = dict( # Комиссии для фьючерсов
                           mult=9.8/0.1,  # мультипликатор
                           moexcomm=FUTURE_TYPE['commodity']),
     SBRF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5200,  # ГО
+                          margin=4878.91 ,  # ГО 11-05-26
                           mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['stock']),
+                          moexcomm=FUTURE_TYPE['stock'],
+                          cost_of_price_step=1),
     BR=FuturesCommission(commission=2.0,  # 2 руб за контракт
                          margin=10374,  # ГО 30-12-24
                          mult=10.167/ 0.01,  # мультипликатор
@@ -116,9 +119,9 @@ futures_comm = dict( # Комиссии для фьючерсов
                           mult=0.5 / 0.05,  # мультипликатор Стоимость шага цены/Шаг цены
                           moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05),
     SPYF=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=5600,  # ГО 27-04-25
-                          mult=0.82655 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05))
+                          margin=4252.12 ,  # ГО 11-05-26
+                          mult=0.83563 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
+                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.01))
 
 def round_to_nearest_price_step(step, value, isbuy):
     """
@@ -414,15 +417,16 @@ class AutoTuneFilterStrategy(bt.Strategy):
     - Long  when ROC crosses above 0 and MinCorr < Thresh
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
 
-    В версии prod12 были добавлены два дополнительных фильтра входа:
-      * min_dc  — минимальный доминирующий цикл AutoTune. Сделки с dc < min_dc
-                  не открываются (короткие циклы = шум, на нём mean-reversion
-                  систематически проигрывает).
-      * max_adx — максимальный ADX. Сделки при ADX > max_adx не
-                  открываются (на сильном тренде возврат к среднему ломается).
-    Нейтральные дефолты (min_dc=0, max_adx=999) воспроизводят прежнее
-    поведение стратегии. В prod12 добавлен параметр adx_period для оптимизации
-    периода ADX, а не только порога max_adx.
+    PROD14:
+    - входы оставлены от AutoTuneFilterStrategy;
+    - выход заменён на trend-following сопровождение из Donchian-стратегии:
+        * chandelier trailing-stop = high_since_entry - K*ATR для long;
+        * chandelier trailing-stop = low_since_entry  + K*ATR для short;
+        * reverse Donchian exit: close < Donchian-low предыдущих M баров для long,
+          close > Donchian-high предыдущих M баров для short.
+
+    Важно: это уже не bracket-логика с take-profit. Параметр tp_mult здесь не используется.
+    Размер позиции считается от risk% и ATR-расстояния до initial chandelier-stop.
     """
 
     params = dict(
@@ -433,14 +437,16 @@ class AutoTuneFilterStrategy(bt.Strategy):
         thresh=-0.22,
         allow_short=True,
         printlog=False,
-        tp_mult=2.0,   # тейк-профит в R
+
+        # === Exit: chandelier trailing-stop + reverse Donchian ==============
+        donchian_exit=10,          # M для reverse Donchian выхода
+        atr_period=14,             # период ATR для chandelier-stop
+        chandelier_atr_mult=3.0,   # K для chandelier trailing-stop
+
         # === Дополнительные фильтры на условие входа =========================
-        # Нейтральные дефолты (фильтры выключены): min_dc=0, max_adx=999.
-        # Чтобы активировать — задайте конкретные значения (например, 25 и 40
-        # по результатам диагностического анализа).
+        # Нейтральный дефолт: min_dc=0.
+        # Чтобы активировать — задайте конкретное значение, например 25.
         min_dc=0,      # минимальный доминирующий цикл AutoTune для входа (бар)
-        max_adx=999,   # максимальный ADX для входа
-        adx_period=14, # период ADX для фильтра max_adx
     )
 
     def log(self, txt):
@@ -454,31 +460,24 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth
         )
-        # Индикатор для фильтра max_adx. В prod12 период вынесен в params,
-        # чтобы можно было оптимизировать не только порог max_adx, но и
-        # чувствительность самого ADX.
-        self.adx = bt.indicators.ADX(self.data, period=self.p.adx_period)
 
         self.stop_loss_price = 0.0
         self.entry_price = 0.0
-        self.take_profit_price = 0.0
+        self.entry_isbuy = None
+        self.high_since_entry = 0.0
+        self.low_since_entry = 0.0
 
         self.roc = self.atf.bp - self.atf.bp(-2)
         self.cross_up = bt.indicators.CrossUp(self.roc, 0.0)
         self.cross_down = bt.indicators.CrossDown(self.roc, 0.0)
 
-        # Базовые условия входа из статьи + два дополнительных фильтра:
+        # Базовые условия входа из статьи + дополнительный фильтр min_dc:
         #   self.atf.dc >= self.p.min_dc   -> отсекаем короткие циклы (шум)
-        #   self.adx    <= self.p.max_adx  -> отсекаем сильные тренды,
-        #                                     где mean-reversion ломается
-        #   self.p.adx_period влияет на сглаживание ADX.
-        # При нейтральных дефолтах (min_dc=0, max_adx=999) условия истинны
-        # всегда и поведение стратегии совпадает с предыдущей версией.
+        # При нейтральном дефолте min_dc=0 условие истинно всегда.
         self.long_signal = bt.And(
             self.cross_up,
             self.atf.mincorr < self.p.thresh,
             self.atf.dc >= self.p.min_dc,
-            self.adx <= self.p.max_adx,
         )
 
         self.short_signal = bt.And(
@@ -486,25 +485,54 @@ class AutoTuneFilterStrategy(bt.Strategy):
             self.atf.mincorr < self.p.thresh,
             self.atf.filt > 0,
             self.atf.dc >= self.p.min_dc,
-            self.adx <= self.p.max_adx,
+        )
+
+        # Exit-индикаторы. Используем [-1] в next(), чтобы сравнивать close
+        # текущего бара с Donchian-каналом ПРОШЛОГО бара, а не с каналом,
+        # куда текущий бар уже включён.
+        self.don_high_exit = bt.indicators.Highest(
+            self.data.high,
+            period=int(self.p.donchian_exit)
+        )
+        self.don_low_exit = bt.indicators.Lowest(
+            self.data.low,
+            period=int(self.p.donchian_exit)
+        )
+        self.atr = bt.indicators.ATR(
+            self.data,
+            period=int(self.p.atr_period)
         )
 
         self.order = None
         self.stop_order = None
-        self.take_profit_order = None
+        self.close_order = None
 
-    def _reset_bracket_state(self):
+    # ---------------------------------------------------------------------
+    # Служебные методы состояния / округления
+    # ---------------------------------------------------------------------
+
+    def _reset_state(self):
         self.order = None
         self.stop_order = None
-        self.take_profit_order = None
+        self.close_order = None
         self.stop_loss_price = 0.0
-        self.take_profit_price = 0.0
         self.entry_price = 0.0
+        self.entry_isbuy = None
+        self.high_since_entry = 0.0
+        self.low_since_entry = 0.0
+
+    @staticmethod
+    def _same_order_ref(order, stored_order):
+        return (
+            order is not None
+            and stored_order is not None
+            and getattr(order, 'ref', None) == getattr(stored_order, 'ref', None)
+        )
 
     def _has_active_orders(self):
         return any(
             order is not None and order.alive()
-            for order in (self.order, self.stop_order, self.take_profit_order)
+            for order in (self.order, self.stop_order, self.close_order)
         )
 
     def _round_exit_price(self, comminfo, price, isbuy):
@@ -512,109 +540,242 @@ class AutoTuneFilterStrategy(bt.Strategy):
             return round_to_nearest_price_step(comminfo.p.cost_of_price_step, price, isbuy)
         return price
 
-    def _calc_bracket_params(self, isbuy):
+    # ---------------------------------------------------------------------
+    # Вход и initial chandelier-stop
+    # ---------------------------------------------------------------------
+
+    def _calc_entry_params(self, isbuy):
+        """
+        Возвращает (size, entry_price, stop_loss_price) или None.
+
+        В PROD14 размер позиции считаем так же, как в Donchian-trend версии:
+        risk_money / (K * ATR * mult), с ограничением по ГО/марже.
+        Это делает риск сделки связанным с initial chandelier-stop.
+        """
         comminfo = self.broker.getcommissioninfo(self.data)
         cash = self.broker.getcash()
-        self.entry_price = self.data.close[0]
+        entry_price = self.data.close[0]
+        atr_now = float(self.atr[0])
 
-        if self.entry_price <= 0:
+        if entry_price <= 0 or atr_now <= 0:
             return None
 
-        if comminfo.p.margin:
-            max_size = cash / comminfo.p.margin
-        else:
-            max_size = cash / self.entry_price
+        stop_distance = float(self.p.chandelier_atr_mult) * atr_now
+        if stop_distance <= 0:
+            return None
 
-        size = int(max_size) - 1
+        risk_money = cash * (self.p.risk / 100.0)
+        denom = stop_distance * comminfo.p.mult
+        if denom <= 0:
+            return None
+
+        size = int(risk_money / denom)
+
+        if comminfo.p.margin > 0:
+            max_by_margin = int(cash / comminfo.p.margin) - 1
+            if max_by_margin <= 0:
+                return None
+            size = min(size, max_by_margin)
+
         if size <= 0:
             return None
 
         direction = 1 if isbuy else -1
-        raw_stop_loss = (
-            self.entry_price
-            - direction * cash * (self.p.risk / 100) / (size * comminfo.p.mult)
-        )
-        self.stop_loss_price = self._round_exit_price(comminfo, raw_stop_loss, isbuy)
+        raw_stop_loss = entry_price - direction * stop_distance
+        stop_loss_price = self._round_exit_price(comminfo, raw_stop_loss, isbuy)
 
-        risk_points = abs(self.entry_price - self.stop_loss_price)
-        if risk_points <= 0:
-            return None
+        return size, entry_price, stop_loss_price
 
-        raw_take_profit = self.entry_price + direction * self.p.tp_mult * risk_points
-        self.take_profit_price = self._round_exit_price(comminfo, raw_take_profit, isbuy)
-
-        return size, self.stop_loss_price, self.take_profit_price
-
-    def _submit_bracket(self, isbuy):
-        bracket_params = self._calc_bracket_params(isbuy)
-        if bracket_params is None:
+    def _submit_entry(self, isbuy):
+        entry_params = self._calc_entry_params(isbuy)
+        if entry_params is None:
             return
 
-        size, stop_price, limit_price = bracket_params
+        size, entry_price, stop_price = entry_params
         side = 'long' if isbuy else 'short'
-        bracket_name = 'buy_bracket' if isbuy else 'sell_bracket'
-        self.log(f'{side.upper()} SIGNAL -> {bracket_name}()')
 
-        bracket_method = self.buy_bracket if isbuy else self.sell_bracket
-        self.order, self.stop_order, self.take_profit_order = bracket_method(
-            size=size,
-            exectype=bt.Order.Market,
-            stopprice=stop_price,
-            stopexec=bt.Order.Stop,
-            limitprice=limit_price,
-            limitexec=bt.Order.Limit,
-            oargs={'name': side},
-            # BackBroker pre-checks bracket children as sequential independent
-            # orders. Disable child checks to avoid false Margin on OCO exits.
-            stopargs={'name': 'stop_loss', '_checksubmit': False},
-            limitargs={'name': 'take_profit', '_checksubmit': False},
-            # stopargs={'name': 'stop_loss'},
-            # limitargs={'name': 'take_profit'},
-        )
+        self.entry_price = entry_price
+        self.stop_loss_price = stop_price
+        self.entry_isbuy = isbuy
+
+        method = self.buy if isbuy else self.sell
+        self.order = method(size=size, exectype=bt.Order.Market)
+        self.order.addinfo(name=side)
 
         self.log(
-            f'STOP={self.stop_loss_price:.2f} | '
-            f'TP({self.p.tp_mult}R)={self.take_profit_price:.2f}'
+            f'{side.upper()} SIGNAL | size={size} | '
+            f'initial_stop≈{self.stop_loss_price:.2f}'
         )
+
+    def _place_stop_after_fill(self, executed_price):
+        """После исполнения входа выставляем initial chandelier-stop."""
+        comminfo = self.broker.getcommissioninfo(self.data)
+        isbuy = self.entry_isbuy
+        atr_now = float(self.atr[0])
+
+        if atr_now <= 0:
+            self.log('WARNING: atr <= 0 на исполнении, stop не выставлен')
+            return
+
+        K = float(self.p.chandelier_atr_mult)
+        direction = 1 if isbuy else -1
+        raw_stop = executed_price - direction * K * atr_now
+        self.stop_loss_price = self._round_exit_price(comminfo, raw_stop, isbuy)
+
+        size = abs(self.position.size)
+        method = self.sell if isbuy else self.buy
+        self.stop_order = method(
+            size=size,
+            exectype=bt.Order.Stop,
+            price=self.stop_loss_price,
+            _checksubmit=False,
+        )
+        self.stop_order.addinfo(name='stop_loss')
+
+        if isbuy:
+            self.high_since_entry = float(executed_price)
+        else:
+            self.low_since_entry = float(executed_price)
+
+        self.log(f'STOP placed at {self.stop_loss_price:.2f}')
+
+    # ---------------------------------------------------------------------
+    # Сопровождение позиции: chandelier + reverse Donchian
+    # ---------------------------------------------------------------------
+
+    def _update_trailing_stop(self):
+        """Пересчитывает chandelier-stop; двигает его только в сторону прибыли."""
+        if self.stop_order is None or not self.stop_order.alive():
+            return
+
+        comminfo = self.broker.getcommissioninfo(self.data)
+        atr_now = float(self.atr[0])
+        if atr_now <= 0:
+            return
+
+        K = float(self.p.chandelier_atr_mult)
+
+        if self.entry_isbuy:
+            if self.data.high[0] > self.high_since_entry:
+                self.high_since_entry = float(self.data.high[0])
+            candidate = self.high_since_entry - K * atr_now
+            new_stop = self._round_exit_price(comminfo, candidate, isbuy=True)
+            if new_stop > self.stop_loss_price:
+                self._move_stop_to(new_stop)
+        else:
+            if self.data.low[0] < self.low_since_entry:
+                self.low_since_entry = float(self.data.low[0])
+            candidate = self.low_since_entry + K * atr_now
+            new_stop = self._round_exit_price(comminfo, candidate, isbuy=False)
+            if new_stop < self.stop_loss_price:
+                self._move_stop_to(new_stop)
+
+    def _move_stop_to(self, new_stop_price):
+        """Отменяет текущий stop и выставляет новый stop на тот же размер позиции."""
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+
+        size = abs(self.position.size)
+        method = self.sell if self.entry_isbuy else self.buy
+        self.stop_order = method(
+            size=size,
+            exectype=bt.Order.Stop,
+            price=new_stop_price,
+            _checksubmit=False,
+        )
+        self.stop_order.addinfo(name='stop_loss')
+        self.stop_loss_price = new_stop_price
+        self.log(f'STOP moved to {new_stop_price:.2f}')
+
+    def _close_by_donchian(self):
+        """Закрывает позицию market-ордером при reverse-Donchian пробое."""
+        if self.position.size == 0:
+            return
+
+        if self.stop_order is not None and self.stop_order.alive():
+            self.cancel(self.stop_order)
+
+        size = abs(self.position.size)
+        method = self.sell if self.position.size > 0 else self.buy
+        self.close_order = method(size=size, exectype=bt.Order.Market)
+        self.close_order.addinfo(name='close_donchian')
+        self.log(f'CLOSE by reverse Donchian at close={self.data.close[0]:.2f}')
+
+    # ---------------------------------------------------------------------
+    # Колбэки Backtrader
+    # ---------------------------------------------------------------------
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
 
-        order_name = getattr(order.info, 'name', None)
+        order_name = getattr(order.info, 'name', None) or '?'
+
+        # В notify_order Backtrader может вернуть clone/copy ордера, поэтому
+        # тип ордера определяем по order.info.name, а для точечной очистки ссылок
+        # дополнительно сверяем ref.
+        is_entry = (order_name in ('long', 'short')) or self._same_order_ref(order, self.order)
+        is_stop = (order_name == 'stop_loss') or self._same_order_ref(order, self.stop_order)
+        is_close = (order_name == 'close_donchian') or self._same_order_ref(order, self.close_order)
 
         if order.status == order.Completed:
-            if order_name == 'long':
-                self.log(f'BUY EXECUTED at {order.executed.price:.2f}')
+            if is_entry:
+                self.log(f'ENTRY {order_name.upper()} EXECUTED at {order.executed.price:.2f}')
+                self.entry_price = order.executed.price
                 self.order = None
-            elif order_name == 'short':
-                self.log(f'SELL EXECUTED at {order.executed.price:.2f}')
-                self.order = None
-            elif order_name == 'stop_loss':
+                self._place_stop_after_fill(order.executed.price)
+            elif is_stop:
                 self.log(f'STOP LOSS EXECUTED at {order.executed.price:.2f}')
-                self._reset_bracket_state()
-            elif order_name == 'take_profit':
-                self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
-                self._reset_bracket_state()
+                self._reset_state()
+            elif is_close:
+                self.log(f'CLOSE EXECUTED at {order.executed.price:.2f}')
+                self._reset_state()
+            else:
+                self.log(
+                    f'WARNING: completed UNKNOWN order at '
+                    f'{order.executed.price:.2f} (name={order_name!r})'
+                )
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'ORDER {order_name} FAILED: {order.getstatusname()}')
 
-            if order_name in ('long', 'short'):
-                self._reset_bracket_state()
+            if is_entry:
+                self._reset_state()
             elif order_name == 'stop_loss':
-                self.stop_order = None
-            elif order_name == 'take_profit':
-                self.take_profit_order = None
+                # Cancel ожидаем при обычном переносе stop или при close_donchian.
+                # Ссылку очищаем только если отменён именно текущий stop, а не
+                # старый stop после его перевыставления.
+                if self._same_order_ref(order, self.stop_order):
+                    self.stop_order = None
+            elif order_name == 'close_donchian':
+                if self._same_order_ref(order, self.close_order):
+                    self.close_order = None
 
     def next(self):
-        if self.position or self._has_active_orders():
+        # Позиция открыта: reverse Donchian имеет приоритет; если он сработал,
+        # двигать stop уже бессмысленно.
+        if self.position:
+            isbuy = self.entry_isbuy if self.entry_isbuy is not None else (self.position.size > 0)
+
+            if isbuy and self.data.close[0] < self.don_low_exit[-1]:
+                self._close_by_donchian()
+                return
+
+            if (not isbuy) and self.data.close[0] > self.don_high_exit[-1]:
+                self._close_by_donchian()
+                return
+
+            self._update_trailing_stop()
+            return
+
+        # Позиции нет: ждём завершения старых ордеров или ищем новый вход.
+        if self._has_active_orders():
             return
 
         if self.long_signal[0]:
-            self._submit_bracket(isbuy=True)
+            self._submit_entry(isbuy=True)
         elif self.p.allow_short and self.short_signal[0]:
-            self._submit_bracket(isbuy=False)
+            self._submit_entry(isbuy=False)
 
 
 
@@ -630,33 +791,37 @@ def main(maxcpus=None):
         thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
-        tp_mult=1.5,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-        # === Фильтры входа (prod12) ===
-        # min_dc и max_adx задают границы фильтров входа,
-        # adx_period задаёт период расчёта ADX и тоже оптимизируется.
-        # Нейтральные дефолты: min_dc=0, max_adx=999, adx_period=14.
-        # min_dc=0,
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
-
-        # min_dc=range(15, 36, 5),
-        # max_adx=range(45, 81, 5),
-        # adx_period=[7, 10, 14, 18, 21, 28],
-        # max_adx=999,
-        # adx_period=14,
-        #
+        # tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        donchian_exit=[8, 10, 12, 14], #10,
+        atr_period=[8, 10, 12, 14], #14,
+        chandelier_atr_mult=[i/4 for i in range(1, 8)], #3.0,
         min_dc=25,
-        max_adx=55,
-        adx_period=10,
     )
 
+    params1 = dict( # MIX
+        write_history=False,
+        risk=5,
+        window=range(30, 61, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=[i / 100 for i in range(25, 61, 5)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=[-i / 100 for i in range(30, 63, 5)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        allow_short=True,
+        printlog=False,
+        # === Exit: chandelier trailing-stop + reverse Donchian ==============
+        # По умолчанию оставлены одиночные значения, чтобы не взорвать число
+        # комбинаций оптимизации. Для оптимизации можно заменить на списки.
+        donchian_exit=10,
+        atr_period=14,
+        chandelier_atr_mult=3.0,
+        min_dc=range(15, 36, 5),  #,  #(15, 25, 35)
+    )
 
     tf = '1h'
+    # start_date = '2023-6-20'
     start_date = '2023-6-20'
     end_date = datetime.today()
     main_opt_metric = 'PROM'  # 'PROM'
 
-    sec = 'MIX'  # 'RTS' 'Si'  #
+    sec = 'MIX'  #'SPYF'  #'MIX'  # 'RTS' 'Si'  'SBRF'#
     total_time = _time.time()
     store = MoexStore()
     datas = list()
@@ -709,7 +874,9 @@ def main(maxcpus=None):
         cerebro.broker = bt.brokers.BackBroker()
         cerebro.broker.setcash(start_cash)
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
-        cerebro.addsizer(AllInSizer)
+        # Размер позиции рассчитывается внутри AutoTuneFilterStrategy
+        # от risk% и ATR-расстояния до initial chandelier-stop.
+        # cerebro.addsizer(AllInSizer)
         # cerebro.addsizer(ATRRiskSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
         cerebro.adddata(data)
@@ -789,6 +956,18 @@ if __name__ == '__main__':
 
 # -------------------------------------------------------
 '''
+    params = dict( # MIX
+        write_history=True,
+        risk=5,
+        window=45, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=0.25,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        allow_short=True,
+        printlog=False,
+        tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        min_dc=25,
+    )
+    
     params = dict( # CNY_1h - final 07-05-26, для 1 год - хорошо, для 4 - плохо!
         write_history=True,
         risk=5,
