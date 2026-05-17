@@ -198,21 +198,21 @@ class AutoTuneDemoStrategy(bt.Strategy):
             bandwidth=self.p.bandwidth,
         )
 
-    def next(self):
-        dt = self.data.datetime.datetime(0)
-        print(
-            f'{dt} | close={self.data.close[0]:.2f} | '
-            f'bp={self.atf.bp[0]:.6f} | '
-            f'filt={self.atf.filt[0]:.6f} | '
-            f'mincorr={self.atf.mincorr[0]:.6f} | '
-            f'dc={self.atf.dc[0]:.2f}'
-        )
+    # def next(self):
+        # dt = self.data.datetime.datetime(0)
+        # print(
+        #     f'{dt} | close={self.data.close[0]:.2f} | '
+        #     f'bp={self.atf.bp[0]:.6f} | '
+        #     f'filt={self.atf.filt[0]:.6f} | '
+        #     f'mincorr={self.atf.mincorr[0]:.6f} | '
+        #     f'dc={self.atf.dc[0]:.2f}'
+        # )
 
 
 if __name__ == '__main__':
     cerebro = bt.Cerebro(stdstats=False)
+    # cerebro = bt.Cerebro()
 
-    # store = MoexStore(write_to_file=True, read_from_file=True)
     store = MoexStore()
     data = store.getdata(
         sec_id='RIM6',  #'MXM6',
@@ -230,4 +230,4 @@ if __name__ == '__main__':
     )
     results = cerebro.run()
     plot(cerebro)
-    cerebro.plot(style='candle')
+    # cerebro.plot(style='candle')
