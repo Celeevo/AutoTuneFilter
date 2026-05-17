@@ -1,6 +1,6 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
-
+import sys
 import os
 import re
 import time as _time
@@ -18,6 +18,25 @@ from itertools import chain
 from statistics import mean, stdev
 import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
+from tqdm import tqdm
+
+_OPT_PBAR = None
+
+
+def opt_progress_cb(_):
+    """
+    Callback для cerebro.optcallback.
+
+    Важно:
+    - функция должна быть объявлена на уровне модуля, не внутри main()
+    - аргумент '_' — это результат одного завершённого варианта оптимизации
+    - сам результат нам не нужен, мы только обновляем progress bar
+    """
+    global _OPT_PBAR
+
+    if _OPT_PBAR is not None:
+        _OPT_PBAR.update(1)
+
 
 SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
 SCRIPT_VERSION_MATCH = re.search(r'(prod\d+)', SCRIPT_NAME, re.IGNORECASE)
@@ -610,18 +629,20 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
 def main(maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
+    global _OPT_PBAR
+
     start_cash = 300000.0
 
     params = dict( # MIX
         write_history=True,
         risk=5,
-        window=45, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=0.25,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
+        window=50, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+        bandwidth=0.34,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
+        thresh=-0.48,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
-        tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-        min_dc=25,
+        tp_mult=[i / 10 for i in range(12, 23)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+        min_dc=range(5,36,5),
     )
 
     tf = '1h'
@@ -640,7 +661,6 @@ def main(maxcpus=None):
     print(contracts)
 
     variants = count_param_variants(params)
-
 
     sheet_size = (variants * len(contracts)) > 1048576
     if sheet_size:
@@ -683,16 +703,30 @@ def main(maxcpus=None):
         cerebro.broker = bt.brokers.BackBroker()
         cerebro.broker.setcash(start_cash)
         cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
-        cerebro.addsizer(AllInSizer)
+        # cerebro.addsizer(AllInSizer)
         # cerebro.addsizer(ATRRiskSizer)
         cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
         cerebro.adddata(data)
 
         cerebro.optstrategy(AutoTuneFilterStrategy, **params)
+        if tqdm is not None:
+            _OPT_PBAR = tqdm(
+                total=variants,
+                desc=data.p.name,
+                dynamic_ncols=True,
+                unit='var',
+                # delay=2,
+                file=sys.stdout,
+            )
+            cerebro.optcallback(opt_progress_cb)
         # cerebro.optstrategy(TrioVesperFin_Chaikin, **params)
         # cerebro.optstrategy(TrioChaikin, **params)
         # cerebro.optstrategy(TrioChaikinWithTrailingExit, **params)
         runs = cerebro.run(stdstats=False, tradehistory=params["write_history"], maxcpus=maxcpus)
+
+        if _OPT_PBAR is not None:
+            _OPT_PBAR.close()
+            _OPT_PBAR = None
 
         for run in runs:  # тут все варианты для одного контракта
             for strategy in run:  # тут уникальные варианты по параметрам

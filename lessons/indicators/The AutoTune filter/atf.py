@@ -19,7 +19,7 @@ class AutoTuneFilter(bt.Indicator):
 
     params = (
         ('window', 20),
-        ('bandwidth', 0.25),
+        ('bandwidth', 0.25)
     )
 
     plotinfo = dict(subplot=True)
