@@ -2,6 +2,7 @@ from datetime import datetime
 from moex_store import MoexStore
 import math
 import backtrader as bt
+from cerebroview import plot
 
 
 class AutoTuneFilter(bt.Indicator):
@@ -19,7 +20,6 @@ class AutoTuneFilter(bt.Indicator):
     params = (
         ('window', 20),
         ('bandwidth', 0.25),
-        ('output', 'bp'),
     )
 
     plotinfo = dict(subplot=True)
@@ -188,12 +188,14 @@ class AutoTuneFilter(bt.Indicator):
 class AutoTuneDemoStrategy(bt.Strategy):
     params = (
         ('window', 20),
+        ('bandwidth', 0.25),
     )
 
     def __init__(self):
         self.atf = AutoTuneFilter(
             self.data.close,
             window=self.p.window,
+            bandwidth=self.p.bandwidth,
         )
 
     def next(self):
@@ -210,16 +212,22 @@ class AutoTuneDemoStrategy(bt.Strategy):
 if __name__ == '__main__':
     cerebro = bt.Cerebro(stdstats=False)
 
-    store = MoexStore(write_to_file=True, read_from_file=True)
+    # store = MoexStore(write_to_file=True, read_from_file=True)
+    store = MoexStore()
     data = store.getdata(
-        sec_id='MXM6',
-        fromdate='2026-03-15',
+        sec_id='RIM6',  #'MXM6',
+        fromdate='2026-01-15',
         todate=datetime.today(),
         tf='1h',
-        name='MXM6'
+        name='RIM6'
     )
 
     cerebro.adddata(data)
-    cerebro.addstrategy(AutoTuneDemoStrategy, window=20)
+    cerebro.addstrategy(
+        AutoTuneDemoStrategy,
+        window=20,
+        bandwidth=0.25,
+    )
     results = cerebro.run()
+    plot(cerebro)
     cerebro.plot(style='candle')
