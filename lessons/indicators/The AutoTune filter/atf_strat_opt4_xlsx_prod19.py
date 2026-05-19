@@ -14,7 +14,7 @@ from backtrader import Analyzer
 from math import sqrt
 import numpy as np
 import pandas as pd
-from itertools import chain
+from itertools import chain, product
 from statistics import mean, stdev
 import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
@@ -52,10 +52,20 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           - max_adx=999,   # максимальный ADX для входа
 # 11-05-26 prod12: добавил adx_period в params, чтобы оптимизировать период ADX;
 #           имя версии prodXX теперь автоматически попадает в имя XLSX-файла.
-# 13-05-26 prod14: добавлен явный режим торговли акциями/фьючерсами.
-#           Для акций используется один непрерывный инструмент без futures-rollover,
-#           отдельная StockCommission с шагом цены и stocklike-логикой,
-#           long-only режим по умолчанию для stock-сценария.
+# 17-05-26 prod16: добавлен режим управления стартовым капиталом по контрактам:
+#           capital_mode='fixed' — каждый контракт стартует с одинакового депозита;
+#           capital_mode='cumulative' — следующий контракт стартует с финальной стоимости счёта
+#           предыдущего контракта для той же комбинации параметров.
+#           Добавлена опция close_on_expiration: если в день экспирации позиция
+#           ещё открыта, стратегия закрывает её на заданном баре дня экспирации
+#           и больше не открывает новые сделки в этот день.
+#           Добавлены метрики максимальной просадки через bt.analyzers.DrawDown:
+#           MaxDDPct, MaxDDMoney, MaxDDLen.
+# 18-05-26 prod18-fix2: добавлен отдельный класс AutoTuneFilterEhlersStrategy,
+#           но режим bracket запускается строго по исходному коду prod17.
+# 19-05-26 prod19: исправлено логирование planned stop-loss/take-profit в trade book;
+#           добавлены MaxClosedDDMoney / MaxClosedDDPct по закрытым сделкам;
+#           входные настройки запуска перенесены вниз скрипта и передаются в main().
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -74,45 +84,15 @@ class FuturesCommission(bt.CommInfoBase):
         return brokers_pocket + moexs_pocket
 
 
-# Класс для расчета комиссии при работе с акциями.
-# ВАЖНО: moexcomm и brokercomm задаются десятичной долей оборота:
-# 0.0003 = 0.03%, 0.0005 = 0.05%.
+# Класс для расчета комиссии при работе с Акциями
 class StockCommission(bt.CommInfoBase):
     params = dict(
-        moexcomm=0.0000,          # комиссия Биржи от оборота
-        brokercomm=0.0005,        # комиссия брокера от оборота
-        cost_of_price_step=0.01,  # стандартный шаг цены для рублёвых акций
-        margin=None,              # акции покупаются на cash, без ГО как у фьючерсов
-        mult=1.0,                 # 1 акция = 1 единица инструмента
-        stocklike=True,           # явно указываем stock-like механику BackBroker
+        moexcomm=0,  # Комиссии Биржи в % от покупки/продажи (0.03%)
+        brokercomm=0  # Комиссии Брокера в % от покупки/продажи (0.03%)
     )
 
     def _getcommission(self, size, price, pseudoexec):
-        turnover = abs(size) * price
-        return turnover * (self.p.moexcomm + self.p.brokercomm)
-
-
-# Комиссии для акций. Если тикер не найден в словаре, используется DEFAULT_STOCK_COMMISSION.
-DEFAULT_STOCK_COMMISSION = StockCommission(
-    moexcomm=0.0000,
-    brokercomm=0.0005,
-    cost_of_price_step=0.01,
-)
-
-stock_comm = dict(
-    SBER=DEFAULT_STOCK_COMMISSION,
-    SBERP=DEFAULT_STOCK_COMMISSION,
-    GAZP=DEFAULT_STOCK_COMMISSION,
-    LKOH=DEFAULT_STOCK_COMMISSION,
-    ROSN=DEFAULT_STOCK_COMMISSION,
-    NVTK=DEFAULT_STOCK_COMMISSION,
-    GMKN=DEFAULT_STOCK_COMMISSION,
-    TATN=DEFAULT_STOCK_COMMISSION,
-    TATNP=DEFAULT_STOCK_COMMISSION,
-    MOEX=DEFAULT_STOCK_COMMISSION,
-    YDEX=DEFAULT_STOCK_COMMISSION,
-    VTBR=StockCommission(moexcomm=0.0000, brokercomm=0.0005, cost_of_price_step=0.000005),
-)
+        return abs(size) * price * (self.p.moexcomm + self.p.brokercomm)
 
 
 futures_comm = dict( # Комиссии для фьючерсов
@@ -173,89 +153,6 @@ futures_comm = dict( # Комиссии для фьючерсов
                           margin=4252.12 ,  # ГО 11-05-26
                           mult=0.83563 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
                           moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.01))
-
-
-def get_commission_info(sec, asset_type):
-    """
-    Возвращает объект комиссии для выбранного типа инструмента.
-
-    asset_type='futures':
-        sec — базовый код фьючерса из futures_comm, например MIX, Si, RTS.
-    asset_type='stock':
-        sec — тикер акции MOEX, например SBER, GAZP, LKOH.
-        Если тикера нет в stock_comm, используется DEFAULT_STOCK_COMMISSION.
-    """
-    if asset_type == 'futures':
-        if sec not in futures_comm:
-            raise KeyError(f"Для фьючерса {sec!r} нет настроек комиссии/ГО в futures_comm")
-        return futures_comm[sec]
-
-    if asset_type == 'stock':
-        return stock_comm.get(sec, DEFAULT_STOCK_COMMISSION)
-
-    raise ValueError("asset_type должен быть 'futures' или 'stock'")
-
-
-def load_market_datas(store, sec, asset_type, start_date, end_date, tf):
-    """
-    Загружает данные в едином формате для фьючерсов и акций.
-
-    Для фьючерсов:
-        берём список контрактов через store.futures.contracts_between(...)
-        и прогоняем каждый контракт отдельно, как в предыдущих версиях.
-
-    Для акций:
-        берём один непрерывный инструмент sec за весь период.
-        Никаких prevexpdate/expdate/rollover нет, потому что у акции нет экспирации.
-    """
-    datas = list()
-
-    if asset_type == 'futures':
-        contracts = store.futures.contracts_between(sec, start_date, end_date)
-        print(contracts)
-
-        for contract in contracts:
-            prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
-
-            if contract == contracts[0]:
-                fromdate = pd.to_datetime(start_date) - timedelta(days=5)
-            else:
-                fromdate = prevexpdate - timedelta(days=5)
-
-            if contract == contracts[-1]:
-                todate = end_date
-            else:
-                todate = store.futures.expdate(contract)
-
-            data = store.getdata(
-                sec_id=contract,
-                fromdate=fromdate,
-                todate=todate,
-                tf=tf,
-                name=contract,
-            )
-            data.sec = sec
-            data.asset_type = asset_type
-            datas.append(data)
-
-        return datas
-
-    if asset_type == 'stock':
-        print([sec])
-        data = store.getdata(
-            sec_id=sec,
-            fromdate=pd.to_datetime(start_date),
-            todate=end_date,
-            tf=tf,
-            name=sec,
-        )
-        data.sec = sec
-        data.asset_type = asset_type
-        datas.append(data)
-        return datas
-
-    raise ValueError("asset_type должен быть 'futures' или 'stock'")
-
 
 def round_to_nearest_price_step(step, value, isbuy):
     """
@@ -322,6 +219,73 @@ def count_param_variants(params_dict):
             variants *= len(value)
     return variants
 
+
+def expand_param_combinations(params_dict):
+    '''
+    Разворачивает словарь params в последовательность конкретных наборов параметров.
+
+    Нужно для capital_mode='cumulative': в этом режиме нельзя запускать один общий
+    optstrategy на контракт, потому что стартовый капитал следующего контракта
+    должен быть своим для каждой комбинации параметров.
+    '''
+    keys = list(params_dict.keys())
+    values = []
+
+    for value in params_dict.values():
+        if isinstance(value, (list, tuple, set, range)):
+            values.append(list(value))
+        else:
+            values.append([value])
+
+    for combo in product(*values):
+        yield dict(zip(keys, combo))
+
+
+def calc_max_drawdown_from_values(values):
+    '''
+    Рассчитывает максимальную просадку по последовательности значений капитала.
+
+    Используется для MaxClosedDD*: это просадка только по закрытым сделкам,
+    т.е. по последовательности cash_after после закрытия сделок.
+    Она не включает внутрисделочную плавающую просадку открытой позиции.
+    '''
+    clean_values = []
+    for value in values or []:
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value):
+            continue
+        clean_values.append(value)
+
+    if not clean_values:
+        return 0.0, 0.0, 0
+
+    peak = clean_values[0]
+    peak_index = 0
+    max_dd_money = 0.0
+    max_dd_pct = 0.0
+    max_dd_len = 0
+
+    for index, value in enumerate(clean_values):
+        if value > peak:
+            peak = value
+            peak_index = index
+            continue
+
+        dd_money = peak - value
+        dd_pct = dd_money / peak * 100.0 if peak else 0.0
+
+        if dd_money > max_dd_money:
+            max_dd_money = dd_money
+            max_dd_pct = dd_pct
+            max_dd_len = index - peak_index
+
+    return max_dd_pct, max_dd_money, max_dd_len
+
 def compute_group_metrics(group, startingcash=1):
     # Объединяем списки PNLs из группы
     pnls = list(chain.from_iterable(group['PNLs']))
@@ -340,6 +304,37 @@ def compute_group_metrics(group, startingcash=1):
     mean = np.mean(pnls) if pnls else 0
     # stdev = np.std(pnls, ddof=1) if len(pnls) > 1 else 0
     stdev = np.std(group['PNL'], ddof=1) if len(group) > 1 else 0
+
+    max_dd_pct = group['MaxDDPct'].max() if 'MaxDDPct' in group.columns else 0
+    max_dd_money = group['MaxDDMoney'].max() if 'MaxDDMoney' in group.columns else 0
+    max_dd_len = group['MaxDDLen'].max() if 'MaxDDLen' in group.columns else 0
+
+    max_closed_dd_pct = group['MaxClosedDDPct'].max() if 'MaxClosedDDPct' in group.columns else 0
+    max_closed_dd_money = group['MaxClosedDDMoney'].max() if 'MaxClosedDDMoney' in group.columns else 0
+
+    # В cumulative-режиме логичнее считать закрытую просадку по всей
+    # последовательности контрактов одного набора параметров. Для этого
+    # склеиваем ClosedEquity из строк группы в один ряд.
+    if 'ClosedEquity' in group.columns:
+        modes = set(str(x).lower() for x in group.get('CapitalMode', pd.Series(dtype=str)).dropna())
+        if 'cumulative' in modes:
+            closed_equity = []
+            for series in group['ClosedEquity']:
+                if not isinstance(series, (list, tuple)) or not series:
+                    continue
+                series = [float(x) for x in series]
+                if not closed_equity:
+                    closed_equity.extend(series)
+                else:
+                    # Если первый элемент нового фрагмента совпадает с последним
+                    # элементом предыдущего, не дублируем его.
+                    if abs(closed_equity[-1] - series[0]) < 0.01:
+                        closed_equity.extend(series[1:])
+                    else:
+                        closed_equity.extend(series)
+
+            if closed_equity:
+                max_closed_dd_pct, max_closed_dd_money, _ = calc_max_drawdown_from_values(closed_equity)
 
     # Получаем последние значения PNL
     last_pnl = group['PNL'].iloc[-1]
@@ -386,6 +381,11 @@ def compute_group_metrics(group, startingcash=1):
         'StdDev': stdev,
         'LastPNL': last_pnl,
         'PreLastPNL': pre_last_pnl,
+        'MaxDDPct': max_dd_pct,
+        'MaxDDMoney': max_dd_money,
+        'MaxDDLen': max_dd_len,
+        'MaxClosedDDMoney': max_closed_dd_money,
+        'MaxClosedDDPct': max_closed_dd_pct,
         'PF': pf,
         'PROM': prom,
         'e-Pardo': e_pardo,
@@ -398,12 +398,46 @@ def compute_group_metrics(group, startingcash=1):
 
 def aggregate_df(df, startingcash=1, sort_by='s-Pardo', sort_by_second='s-Pardo'):
     first_col = df.columns[0]
-    aggr = df.groupby(first_col, sort=False)[['PNLs', 'PNL', 'Asset']].apply(compute_group_metrics, startingcash=startingcash).reset_index()
+    metric_cols = ['PNLs', 'PNL', 'Asset']
+    for col in (
+        'MaxDDPct', 'MaxDDMoney', 'MaxDDLen',
+        'MaxClosedDDMoney', 'MaxClosedDDPct',
+        'ClosedEquity', 'CapitalMode',
+    ):
+        if col in df.columns:
+            metric_cols.append(col)
+
+    aggr = df.groupby(first_col, sort=False)[metric_cols].apply(compute_group_metrics, startingcash=startingcash).reset_index()
     aggr = aggr.sort_values(sort_by, ascending=False)
     # Проверка значения в столбце 's-Pardo' и вторичная сортировка при необходимости
     if 's-Pardo' in aggr.columns and aggr['s-Pardo'].iloc[0] <= 0:
         aggr = aggr.sort_values(sort_by_second, ascending=False)
     return aggr.round(2)
+
+
+def add_drawdown_metrics(strategy, analysis):
+    """
+    Добавляет в строку результата метрики просадки из bt.analyzers.DrawDown.
+
+    Важно: DrawDown считается внутри конкретного прогона Cerebro.
+    В fixed-режиме это просадка отдельного контракта. В cumulative-режиме это
+    просадка внутри очередного контракта с учётом стартового капитала, который
+    был перенесён с предыдущего контракта. Это не сквозная equity-curve DD по
+    всей цепочке контрактов.
+    """
+    dd = {}
+
+    try:
+        dd = strategy.analyzers.dd.get_analysis()
+    except Exception:
+        dd = {}
+
+    max_dd = dd.get('max', {}) if isinstance(dd, dict) else {}
+
+    analysis['MaxDDPct'] = max_dd.get('drawdown', 0.0)
+    analysis['MaxDDMoney'] = max_dd.get('moneydown', 0.0)
+    analysis['MaxDDLen'] = max_dd.get('len', 0)
+
 
 class SmartAnalyzer(Analyzer):
     '''
@@ -448,6 +482,7 @@ class SmartAnalyzer(Analyzer):
         self.trades = list()
         self.trades_details = list()
         self.depos = self.strategy.broker.startingcash
+        self.closed_equity = [float(self.depos)]
 
     def notify_trade(self, trade):
         if trade.isclosed:
@@ -456,18 +491,23 @@ class SmartAnalyzer(Analyzer):
             else:
                 self.lt_arr.append(trade.pnlcomm)
 
+            finish_cash = float(self.strategy.broker.getcash())
+            self.closed_equity.append(finish_cash)
+
             # Section for trade-book
             if self.strategy.p.write_history:
                 trade.start_cash = self.depos
-                trade.finish_cash = self.strategy.broker.getcash()
+                trade.finish_cash = finish_cash
                 trade.stop_loss_price = self.strategy.stop_loss_price
+                trade.take_profit_price = self.strategy.take_profit_price
                 trade.sec_id = trade.getdataname()
                 # Был ли источник склеен с помощью rollover?
                 # Если да, добавляем имена склеенных источников
                 # if hasattr(trade.data, '_d'):
                 #     trade.sec_id += '-' + trade.data._d._name
                 self.trades.append(trade)
-                self.depos = self.strategy.broker.getcash()
+
+            self.depos = finish_cash
 
     def stop(self):
         '''
@@ -488,8 +528,20 @@ class SmartAnalyzer(Analyzer):
         swt = sum(self.pt_arr)  # sum profit trades
         slt = sum(self.lt_arr)  # sum losing trades
         pnl = int(sum(self.pt_arr + self.lt_arr))
+        start_cash = float(getattr(self.strategy.broker, 'startingcash', self.depos))
+        end_cash = float(self.strategy.broker.getcash())
+        end_value = float(self.strategy.broker.getvalue())
 
         self.rets[params_head] = params_str
+        max_closed_dd_pct, max_closed_dd_money, _ = calc_max_drawdown_from_values(self.closed_equity)
+
+        self.rets['StartCash'] = start_cash
+        self.rets['EndCash'] = end_cash
+        self.rets['EndValue'] = end_value
+        self.rets['ContractPNL'] = end_value - start_cash
+        self.rets['MaxClosedDDMoney'] = max_closed_dd_money
+        self.rets['MaxClosedDDPct'] = max_closed_dd_pct
+        self.rets['ClosedEquity'] = list(self.closed_equity)
         self.rets['PNL'] = pnl
         self.rets['WinTr'] = wt
         self.rets['LossTr'] = lt
@@ -516,7 +568,17 @@ class SmartAnalyzer(Analyzer):
                     entry_executed_time=f'{bt.num2date(entry_order.executed.dt):%H:%M}',
                     entry_requested_price=entry_order.created.price,
                     entry_executed_price=entry_order.executed.price,
-                    stop_loss_price=getattr(trade, 'stop_loss_price', 0),
+                    stop_loss_price=getattr(
+                        entry_order.info,
+                        'planned_stop_loss_price',
+                        getattr(trade, 'stop_loss_price', 0),
+                    ),
+                    take_profit_price=getattr(
+                        entry_order.info,
+                        'planned_take_profit_price',
+                        getattr(trade, 'take_profit_price', 0),
+                    ),
+                    planned_risk_points=getattr(entry_order.info, 'planned_risk_points', 0),
                     size=entry_order.size,
                     entry_type='long' if entry_order.isbuy() else 'short',
                     # entry_ma_disposition = entry_order.info.ma_disp,
@@ -528,7 +590,7 @@ class SmartAnalyzer(Analyzer):
                     exit_executed_time=f'{bt.num2date(exit_order.executed.dt):%H:%M}',
                     exit_requested_price=exit_order.created.price,
                     exit_executed_price=exit_order.executed.price,
-                    # exit_type=exit_order.info.name,
+                    exit_type=getattr(exit_order.info, 'name', ''),
 
                     result=1 if trade.pnl > 0 else 0,
                     pnl=int(trade.pnlcomm),
@@ -571,6 +633,9 @@ class AutoTuneFilterStrategy(bt.Strategy):
         allow_short=True,
         printlog=False,
         tp_mult=2.0,   # тейк-профит в R
+        close_on_expiration=True,  # закрывать открытую позицию в день экспирации контракта
+        expiration_exit_bar=3,     # номер бара дня экспирации, на котором отправляем close()
+        contract_expdate=None,     # дата экспирации текущего контракта; передаётся из main()
         # === Дополнительные фильтры на условие входа =========================
         # Нейтральные дефолты (фильтры выключены): min_dc=0, max_adx=999.
         # Чтобы активировать — задайте конкретные значения (например, 25 и 40
@@ -618,11 +683,19 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
+        self.expiration_close_order = None
+
+        # Счётчик баров внутри текущего календарного дня нужен для выхода
+        # на N-м баре дня экспирации. Считаем именно бары, которые реально
+        # пришли из data feed, а не абстрактные часы торговой сессии.
+        self._current_session_date = None
+        self._session_bar_no = 0
 
     def _reset_bracket_state(self):
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
+        self.expiration_close_order = None
         self.stop_loss_price = 0.0
         self.take_profit_price = 0.0
         self.entry_price = 0.0
@@ -630,13 +703,67 @@ class AutoTuneFilterStrategy(bt.Strategy):
     def _has_active_orders(self):
         return any(
             order is not None and order.alive()
-            for order in (self.order, self.stop_order, self.take_profit_order)
+            for order in (self.order, self.stop_order, self.take_profit_order, self.expiration_close_order)
         )
 
     def _round_exit_price(self, comminfo, price, isbuy):
         if comminfo.p.cost_of_price_step != 0:
             return round_to_nearest_price_step(comminfo.p.cost_of_price_step, price, isbuy)
         return price
+
+    def _contract_expdate(self):
+        """Возвращает дату экспирации текущего контракта как date или None."""
+        expdate = self.p.contract_expdate
+
+        if expdate is None:
+            return None
+
+        return pd.to_datetime(expdate).date()
+
+    def _update_session_bar_no(self):
+        """Считает номер бара внутри текущего календарного дня."""
+        current_date = self.data.datetime.date(0)
+
+        if current_date != self._current_session_date:
+            self._current_session_date = current_date
+            self._session_bar_no = 1
+        else:
+            self._session_bar_no += 1
+
+    def _is_expiration_day(self):
+        expdate = self._contract_expdate()
+        return expdate is not None and self.data.datetime.date(0) == expdate
+
+    def _is_after_expiration_exit_bar(self):
+        return (
+            self.p.close_on_expiration
+            and self._is_expiration_day()
+            and self._session_bar_no >= int(self.p.expiration_exit_bar)
+        )
+
+    def _cancel_bracket_children(self):
+        """Отменяет защитные bracket-ордера перед принудительным закрытием."""
+        for order in (self.stop_order, self.take_profit_order):
+            if order is not None and order.alive():
+                self.cancel(order)
+
+        self.stop_order = None
+        self.take_profit_order = None
+
+    def _submit_expiration_close(self):
+        """Закрывает открытую позицию на заданном баре дня экспирации."""
+        if not self.position:
+            return
+
+        if self.expiration_close_order is not None and self.expiration_close_order.alive():
+            return
+
+        self._cancel_bracket_children()
+        self.log(
+            f'EXPIRATION EXIT -> close() on bar '
+            f'{self._session_bar_no} of {self.data.datetime.date(0)}'
+        )
+        self.expiration_close_order = self.close(name='expiration_close')
 
     def _calc_bracket_params(self, isbuy):
         comminfo = self.broker.getcommissioninfo(self.data)
@@ -689,7 +816,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
             stopexec=bt.Order.Stop,
             limitprice=limit_price,
             limitexec=bt.Order.Limit,
-            oargs={'name': side},
+            oargs={
+                'name': side,
+                'planned_stop_loss_price': self.stop_loss_price,
+                'planned_take_profit_price': self.take_profit_price,
+                'planned_risk_points': abs(self.entry_price - self.stop_loss_price),
+            },
             # BackBroker pre-checks bracket children as sequential independent
             # orders. Disable child checks to avoid false Margin on OCO exits.
             stopargs={'name': 'stop_loss', '_checksubmit': False},
@@ -722,6 +854,9 @@ class AutoTuneFilterStrategy(bt.Strategy):
             elif order_name == 'take_profit':
                 self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
                 self._reset_bracket_state()
+            elif order_name == 'expiration_close':
+                self.log(f'EXPIRATION CLOSE EXECUTED at {order.executed.price:.2f}')
+                self._reset_bracket_state()
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'ORDER {order_name} FAILED: {order.getstatusname()}')
@@ -732,8 +867,20 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 self.stop_order = None
             elif order_name == 'take_profit':
                 self.take_profit_order = None
+            elif order_name == 'expiration_close':
+                self.expiration_close_order = None
 
     def next(self):
+        self._update_session_bar_no()
+
+        # В день экспирации не открываем новые сделки. Если позиция была
+        # перенесена в этот день, на заданном баре отправляем рыночный close().
+        # В обычном режиме Backtrader такой close() исполнится на следующем баре.
+        if self.p.close_on_expiration and self._is_expiration_day():
+            if self._is_after_expiration_exit_bar():
+                self._submit_expiration_close()
+            return
+
         if self.position or self._has_active_orders():
             return
 
@@ -743,183 +890,396 @@ class AutoTuneFilterStrategy(bt.Strategy):
             self._submit_bracket(isbuy=False)
 
 
+class AutoTuneFilterEhlersStrategy(AutoTuneFilterStrategy):
+    """
+    Вариант стратегии с выходом/разворотом по оригинальной логике Эйлерса.
 
-def main(maxcpus=None):
+    Базовый класс AutoTuneFilterStrategy в prod17 оставлен для bracket-режима
+    без изменения логики. Этот отдельный класс нужен, чтобы режим bracket давал
+    те же результаты, что и prod17, а эксперимент с выходом по Эйлерсу не влиял
+    на текущий рабочий алгоритм.
+    """
+
+    def _calc_ehlers_target_size(self):
+        """
+        Рассчитывает целевой размер позиции для always-in-the-market логики.
+
+        Здесь нет SL/TP bracket-ордера. При обратном сигнале стратегия должна
+        перейти к противоположной позиции. Размер считаем от текущей стоимости
+        счёта, а не только от свободного cash, потому что при развороте часть
+        средств уже занята маржой открытой позиции.
+        """
+        comminfo = self.broker.getcommissioninfo(self.data)
+        account_value = self.broker.getvalue()
+        self.entry_price = self.data.close[0]
+
+        if self.entry_price <= 0:
+            return 0
+
+        if comminfo.p.margin:
+            max_size = account_value / comminfo.p.margin
+        else:
+            max_size = account_value / self.entry_price
+
+        size = int(max_size) - 1
+        return max(size, 0)
+
+    def _submit_ehlers_target(self, isbuy):
+        """
+        Отправляет ордер к целевой позиции по логике Эйлерса.
+
+        Long signal  -> целевая позиция +size.
+        Short signal -> целевая позиция -size.
+
+        Если уже открыта противоположная позиция, один рыночный ордер закрывает
+        текущую позицию и открывает новую в другую сторону.
+        """
+        if self.position.size > 0 and isbuy:
+            return
+        if self.position.size < 0 and not isbuy:
+            return
+
+        target_size = self._calc_ehlers_target_size()
+        if target_size <= 0:
+            return
+
+        target_position = target_size if isbuy else -target_size
+        delta = target_position - self.position.size
+
+        if delta == 0:
+            return
+
+        side = 'long' if delta > 0 else 'short'
+        action = 'BUY' if delta > 0 else 'SELL'
+        size = abs(delta)
+
+        self.log(
+            f'EHLERS {action} SIGNAL -> target={target_position}, '
+            f'current={self.position.size}, order_size={size}'
+        )
+
+        if delta > 0:
+            self.order = self.buy(size=size, name=side)
+        else:
+            self.order = self.sell(size=size, name=side)
+
+    def _submit_ehlers_close(self):
+        """Закрывает позицию по обратному сигналу без разворота в short."""
+        if not self.position:
+            return
+        if self.order is not None and self.order.alive():
+            return
+
+        self.log('EHLERS EXIT -> close()')
+        self.order = self.close(name='ehlers_exit')
+
+    def notify_order(self, order):
+        super().notify_order(order)
+
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        order_name = getattr(order.info, 'name', None)
+
+        if order_name == 'ehlers_exit':
+            if order.status == order.Completed:
+                self.log(f'EHLERS EXIT EXECUTED at {order.executed.price:.2f}')
+            self.order = None
+
+    def next(self):
+        self._update_session_bar_no()
+
+        # В день экспирации не открываем новые сделки. Если позиция была
+        # перенесена в этот день, на заданном баре отправляем рыночный close().
+        if self.p.close_on_expiration and self._is_expiration_day():
+            if self._is_after_expiration_exit_bar():
+                self._submit_expiration_close()
+            return
+
+        if self._has_active_orders():
+            return
+
+        if not self.position:
+            if self.long_signal[0]:
+                self._submit_ehlers_target(isbuy=True)
+            elif self.p.allow_short and self.short_signal[0]:
+                self._submit_ehlers_target(isbuy=False)
+
+        elif self.position.size > 0:
+            if self.short_signal[0]:
+                if self.p.allow_short:
+                    self._submit_ehlers_target(isbuy=False)
+                else:
+                    self._submit_ehlers_close()
+
+        elif self.position.size < 0:
+            if self.long_signal[0]:
+                self._submit_ehlers_target(isbuy=True)
+
+
+def main(maxcpus=None, settings=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     global _OPT_PBAR
 
-    start_cash = 300000.0
+    if settings is None:
+        raise ValueError('settings must be provided')
 
-    # ---------------------------------------------------------------------
-    # Выбор рынка
-    # ---------------------------------------------------------------------
-    # asset_type='futures' — старый режим: sec = базовый код фьючерса,
-    #                        данные берутся отдельными контрактами.
-    # asset_type='stock'   — режим акций: sec = тикер акции MOEX,
-    #                        данные берутся одним непрерывным рядом.
-    #
-    # Примеры:
-    #   futures: asset_type='futures', sec='MIX'
-    #   stock  : asset_type='stock',   sec='SBER'
-    # ---------------------------------------------------------------------
-    asset_type = 'stock'  # 'futures' или 'stock'
-    sec = 'SBER'          # для futures, например: 'MIX'; для stock, например: 'SBER'
+    start_cash = float(settings.get('start_cash', 300000.0))
+    capital_mode = settings.get('capital_mode', 'fixed')
+    exit_mode = settings.get('exit_mode', 'bracket')
+    close_on_expiration = bool(settings.get('close_on_expiration', True))
+    expiration_exit_bar = int(settings.get('expiration_exit_bar', 3))
 
-    params = dict(  # базовый набор параметров
-        write_history=False,
-        risk=5,
-        window=50, #range(20,81,5),
-        bandwidth=0.32, #[i / 100 for i in range(20, 45, 2)], #,
-        thresh=-0.42, #[-i / 100 for i in range(30, 51, 2)],  #-0.5,
-        # Для акций по умолчанию оставляем long-only. Шорты по акциям в реальности
-        # требуют маржинального режима и доступности бумаги в short-list брокера.
-        allow_short=False if asset_type == 'stock' else True,
-        printlog=False,
-        tp_mult=[i / 10 for i in range(3, 12)],
-        min_dc=range(5,56,5), #25, #
-    )
-    params1 = dict(  # базовый набор параметров
-        write_history=False,
-        risk=5,
-        window=range(20,81,5),
-        bandwidth=[i / 100 for i in range(20, 45, 2)], #,
-        thresh=[-i / 100 for i in range(30, 51, 2)],  #-0.5,
-        # Для акций по умолчанию оставляем long-only. Шорты по акциям в реальности
-        # требуют маржинального режима и доступности бумаги в short-list брокера.
-        allow_short=False if asset_type == 'stock' else True,
-        printlog=False,
-        tp_mult=[i / 10 for i in range(3, 12, 2)],
-        min_dc=25, #range(10,36,5), #25, #
-    )
+    params = dict(settings['params'])
 
-    tf = '1h'
-    start_date = '2025-5-16'
-    end_date = datetime.today()
-    main_opt_metric = 'PROM'
+    tf = settings.get('tf', '1h')
+    start_date = settings.get('start_date', '2023-6-20')
+    end_date = settings.get('end_date') or datetime.today()
+    main_opt_metric = settings.get('main_opt_metric', 'PROM')
+    sec = settings.get('sec', 'SPYF')
 
     total_time = _time.time()
     store = MoexStore()
+    datas = list()
 
-    datas = load_market_datas(
-        store=store,
-        sec=sec,
-        asset_type=asset_type,
-        start_date=start_date,
-        end_date=end_date,
-        tf=tf,
-    )
+    # for sec in futures:
+    contracts = store.futures.contracts_between(sec, start_date, end_date)
+    print(contracts)
 
     variants = count_param_variants(params)
-    data_count = len(datas)
-    data_count_label = 'контрактов' if asset_type == 'futures' else 'инструментов'
 
-    sheet_size = (variants * data_count) > 1048576
+    sheet_size = (variants * len(contracts)) > 1048576
     if sheet_size:
-        print(
-            f"Excel sheet is too large! Your sheet size is: {variants * data_count}, "
-            f"Max sheet size is: 1'048'576"
-        )
-
-    print(
-        f'Рассчитываем {variants} вариантов стратегии для каждого из '
-        f'{data_count} {data_count_label}. Итого {variants * data_count} вариантов.'
-    )
-    print(f'Режим рынка: {asset_type}, инструмент: {sec}, таймфрейм: {tf}')
+        print(f"Excel sheet is too large! Your sheet size is: {variants * len(contracts)}, Max sheet size is: 1'048'576")
+    print(f'Рассчитываем {variants} вариантов стратегии для '
+          f'каждого из {len(contracts)} контрактов. Итого '
+          f'{variants * len(contracts)} вариантов.')
     print(f'Время пошло, {datetime.now():%H:%M:%S}')
+
+    for contract in contracts:
+        prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
+
+        if contract == contracts[0]:
+            fromdate = pd.to_datetime(start_date) - timedelta(days=5)
+            # start_trades = pd.to_datetime(start_date)
+        else:
+            fromdate = prevexpdate - timedelta(days=5)
+            # start_trades = prevexpdate
+        contract_expdate = pd.to_datetime(store.futures.expdate(contract)).date()
+
+        if contract == contracts[-1]:
+            todate = end_date
+        else:
+            todate = store.futures.expdate(contract)
+
+        data = store.getdata(sec_id=contract,
+                                   fromdate=fromdate,
+                                   todate=todate,
+                                   tf=tf, name=contract)
+
+        data.sec = sec
+        data.contract_expdate = contract_expdate
+        datas.append(data)
 
     results = []
     trades = []
     analyzer_params = dict(it_params=iterable_params(params))
 
-    for data in datas:
-        analyzer_params['asset'] = data.sec
-        st_time = _time.time()
+    if capital_mode not in ('fixed', 'cumulative'):
+        raise ValueError("capital_mode должен быть 'fixed' или 'cumulative'")
 
-        cerebro = bt.Cerebro()
-        cerebro.broker = bt.brokers.BackBroker()
-        cerebro.broker.setcash(start_cash)
+    exit_mode = str(exit_mode).lower()
+    if exit_mode not in ('bracket', 'ehlers'):
+        raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
 
-        commission_info = get_commission_info(data.sec, asset_type)
-        cerebro.broker.addcommissioninfo(commission_info, name=data.p.name)
+    if capital_mode == 'fixed':
+        # Старый режим: каждый контракт тестируется независимо и стартует
+        # с одинакового депозита start_cash.
+        for data in datas:
+            analyzer_params['asset'] = data.sec
+            st_time = _time.time()
+            cerebro = bt.Cerebro()
+            cerebro.broker = bt.brokers.BackBroker()
+            cerebro.broker.setcash(start_cash)
+            cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
+            cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
+            cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
+            cerebro.adddata(data)
 
-        cerebro.addsizer(AllInSizer)
-        cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
-        cerebro.adddata(data)
+            strategy_params = dict(
+                params,
+                close_on_expiration=close_on_expiration,
+                expiration_exit_bar=expiration_exit_bar,
+                contract_expdate=data.contract_expdate,
+            )
+            if exit_mode == 'bracket':
+                cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
+            else:
+                cerebro.optstrategy(AutoTuneFilterEhlersStrategy, **strategy_params)
+            if tqdm is not None:
+                _OPT_PBAR = tqdm(
+                    total=variants,
+                    desc=data.p.name,
+                    dynamic_ncols=True,
+                    unit='var',
+                    file=sys.stdout,
+                )
+                cerebro.optcallback(opt_progress_cb)
 
-        cerebro.optstrategy(AutoTuneFilterStrategy, **params)
+            runs = cerebro.run(stdstats=False, tradehistory=params["write_history"], maxcpus=maxcpus)
+
+            if _OPT_PBAR is not None:
+                _OPT_PBAR.close()
+                _OPT_PBAR = None
+
+            for run in runs:  # тут все варианты для одного контракта
+                for strategy in run:  # тут уникальные варианты по параметрам
+                    analyzer = strategy.analyzers.full
+                    analysis = dict()
+                    analysis.update(analyzer.get_analysis())
+                    add_drawdown_metrics(strategy, analysis)
+                    analysis['Data'] = data.p.name
+                    analysis['PNLs'] = analyzer.get_trades_pnl()
+                    analysis['Asset'] = data.sec
+                    analysis['CapitalMode'] = capital_mode
+                    results.append(analysis)
+
+                    if params['write_history']:
+                        trades_data = analyzer.get_trades()
+                        for tr in trades_data:
+                            tr['capital_mode'] = capital_mode
+                        trades.extend(trades_data)
+
+            print(
+                f'Прогон {len(runs)} вариантов стратегии для контракта '
+                f'{data.p.name} за {round(_time.time() - st_time, 2)} сек., '
+                f'{round((_time.time() - st_time) / 60, 2)} мин., '
+                f'V (скорость) = {round(len(runs) / (_time.time() - st_time), 2)} вар/сек, '
+                f'{str(datetime.now().time())[:5]}'
+            )
+            gc.collect()
+
+    else:
+        # Кумулятивный режим: одна комбинация параметров последовательно проходит
+        # все контракты. Финальная стоимость счёта после контракта N становится
+        # стартовым капиталом для контракта N+1 той же комбинации параметров.
+        param_variants = list(expand_param_combinations(params))
+        total_runs = len(param_variants) * len(datas)
+
         if tqdm is not None:
             _OPT_PBAR = tqdm(
-                total=variants,
-                desc=data.p.name,
+                total=total_runs,
+                desc='cumulative',
                 dynamic_ncols=True,
-                unit='var',
-                # delay=2,
+                unit='run',
                 file=sys.stdout,
             )
-            cerebro.optcallback(opt_progress_cb)
 
+        for variant_no, strategy_params in enumerate(param_variants, start=1):
+            current_cash = start_cash
+            variant_time = _time.time()
 
-        runs = cerebro.run(
-            stdstats=False,
-            tradehistory=params["write_history"],
-            maxcpus=maxcpus,
-        )
-        if _OPT_PBAR is not None:
-            _OPT_PBAR.close()
-            _OPT_PBAR = None
+            for data in datas:
+                analyzer_params['asset'] = data.sec
+                st_time = _time.time()
 
-        for run in runs:  # тут все варианты для одного инструмента/контракта
-            for strategy in run:  # тут уникальные варианты по параметрам
+                cerebro = bt.Cerebro()
+                cerebro.broker = bt.brokers.BackBroker()
+                cerebro.broker.setcash(current_cash)
+                cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
+                cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
+                cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
+                cerebro.adddata(data)
+                run_strategy_params = dict(
+                    strategy_params,
+                    close_on_expiration=close_on_expiration,
+                    expiration_exit_bar=expiration_exit_bar,
+                    contract_expdate=data.contract_expdate,
+                )
+                if exit_mode == 'bracket':
+                    cerebro.addstrategy(AutoTuneFilterStrategy, **run_strategy_params)
+                else:
+                    cerebro.addstrategy(AutoTuneFilterEhlersStrategy, **run_strategy_params)
+
+                runs = cerebro.run(stdstats=False, tradehistory=params["write_history"])
+                strategy = runs[0]
                 analyzer = strategy.analyzers.full
+
                 analysis = dict()
                 analysis.update(analyzer.get_analysis())
+                add_drawdown_metrics(strategy, analysis)
                 analysis['Data'] = data.p.name
                 analysis['PNLs'] = analyzer.get_trades_pnl()
                 analysis['Asset'] = data.sec
-                analysis['AssetType'] = asset_type
+                analysis['CapitalMode'] = capital_mode
                 results.append(analysis)
 
                 if params['write_history']:
                     trades_data = analyzer.get_trades()
+                    for tr in trades_data:
+                        tr['capital_mode'] = capital_mode
                     trades.extend(trades_data)
 
-        print(
-            f'Прогон {len(runs)} вариантов стратегии для '
-            f'{asset_type} {data.p.name} за {round(_time.time() - st_time, 2)} сек., '
-            f'{round((_time.time() - st_time) / 60, 2)} мин., '
-            f'V (скорость) = {round(len(runs) / (_time.time() - st_time), 2)} вар/сек, '
-            f'{str(datetime.now().time())[:5]}'
-        )
-        gc.collect()
+                # Для следующего контракта используем финальную стоимость счёта.
+                # При close_on_expiration=True позиция должна быть закрыта до конца контракта,
+                # поэтому EndValue не должен включать незакрытый mark-to-market хвост.
+                current_cash = analysis.get('EndValue', cerebro.broker.getvalue())
 
-    print(
-        f'Весь прогон за {round(_time.time() - total_time, 2)} сек., '
-        f'{round((_time.time() - total_time) / 3600, 2)} часов.'
-    )
+                if _OPT_PBAR is not None:
+                    _OPT_PBAR.update(1)
+                    _OPT_PBAR.set_postfix_str(f'{variant_no}/{len(param_variants)} {data.p.name}')
+
+                print(
+                    f'Кумулятивный прогон {variant_no}/{len(param_variants)}, '
+                    f'контракт {data.p.name}: start={analysis.get("StartCash", 0):.2f}, '
+                    f'end={analysis.get("EndValue", 0):.2f}, '
+                    f'PNL={analysis.get("ContractPNL", 0):.2f}, '
+                    f'{round(_time.time() - st_time, 2)} сек., '
+                    f'{str(datetime.now().time())[:5]}'
+                )
+                gc.collect()
+
+            print(
+                f'Комбинация {variant_no}/{len(param_variants)} прошла все контракты за '
+                f'{round((_time.time() - variant_time) / 60, 2)} мин.'
+            )
+
+        if _OPT_PBAR is not None:
+            _OPT_PBAR.close()
+            _OPT_PBAR = None
+
+    print(f'Весь прогон за {round(_time.time() - total_time, 2)} сек., '
+          f'{round((_time.time() - total_time) / 3600, 2)} часов.')
 
     df1 = pd.DataFrame(results).round(2)
     if params['write_history']:
         df2 = pd.DataFrame(trades).round(3)
-
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
     df4 = pd.DataFrame(
         list(params.items()) + [
-            ('asset_type', asset_type),
-            ('sec', sec),
+            ('start_cash', start_cash),
+            ('capital_mode', capital_mode),
+            ('exit_mode', exit_mode),
+            ('close_on_expiration', close_on_expiration),
+            ('expiration_exit_bar', expiration_exit_bar),
             ('start_date', start_date),
             ('end_date', end_date),
         ],
         columns=['Parameter', 'Value']
     )
+    for col in ('PNLs', 'ClosedEquity'):
+        if col in df1.columns:
+            del df1[col]
 
-    del df1['PNLs']
-
+    # Сохраняем штамп времени для имени XLSX-файла с результатами
     timestamp = datetime.now().strftime("%d-%m-%y %H-%M")
 
-    # В имени файла теперь дополнительно есть asset_type, чтобы не путать
-    # результаты фьючерсов и акций.
-    results_file = f'opt_results_{SCRIPT_VERSION}_{asset_type}_{sec}_{tf}_{timestamp}.xlsx'
+    # Создаём имя XLSX-файла результатов. Версия берётся из имени
+    # запускаемого скрипта: например, atf_strat_opt4_xlsx_prod12.py -> prod12.
+    results_file = f'opt_results_{SCRIPT_VERSION}_{sec}_{tf}_{timestamp}.xlsx'
 
+    # Записываем df в xlsx файл, xlsxwriter импортируем
+    # отдельно pip install xlsxwriter
     with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
         if not sheet_size:
             df1.to_excel(writer, sheet_name='by Contacts', index=False)
@@ -932,58 +1292,44 @@ def main(maxcpus=None):
     os.startfile(results_file)
 
 
+
 if __name__ == '__main__':
+    STRATEGY_PARAMS = dict(
+        write_history=True,
+        risk=5,
+        window=60,
+        bandwidth=0.28,
+        thresh=-0.4,
+        allow_short=True,
+        printlog=False,
+        tp_mult=1.5,
+        min_dc=25,
+    )
+
+    RUN_SETTINGS = dict(
+        start_cash=300000.0,
+
+        # fixed      — каждый контракт запускается с одинакового start_cash.
+        # cumulative — капитал переносится от контракта к контракту отдельно
+        #              для каждой комбинации параметров.
+        capital_mode='cumulative',
+
+        # bracket — текущая рабочая логика: stop-loss / take-profit.
+        # ehlers  — выход/разворот по обратному сигналу ATF из статьи Эйлерса.
+        exit_mode='bracket',
+
+        close_on_expiration=True,
+        expiration_exit_bar=3,
+
+        params=STRATEGY_PARAMS,
+        tf='1h',
+        start_date='2023-6-20',
+        end_date=datetime.today(),
+        main_opt_metric='PROM',
+        sec='SPYF',
+    )
+
     maxcpus = os.cpu_count()
     available_cpus = maxcpus - 2
     print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
-    main(available_cpus)
-
-
-# -------------------------------------------------------
-'''
-    params = dict( # MIX
-        write_history=True,
-        risk=5,
-        window=45, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=0.25,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=-0.5,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
-        allow_short=True,
-        printlog=False,
-        tp_mult=[i / 10 for i in range(7, 16)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-        min_dc=25,
-    )
-    
-    params = dict( # CNY_1h - final 07-05-26, для 1 год - хорошо, для 4 - плохо!
-        write_history=True,
-        risk=5,
-        window=28,  #[48, 49, 50],  #range(16,57),  #30,
-        bandwidth=[i / 100 for i in range(43, 48)], #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
-        thresh=[-i / 100 for i in range(65, 86)],  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
-        allow_short=True,
-        printlog=False,
-        tp_mult=[i / 10 for i in range(17, 21)],  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-    )
-    
-        params = dict(  # SIM6 - final 08-05-26 44-0.3--0.54-2.2 1 год ничего, 4 года - плохо
-        write_history=True,
-        risk=5,
-        window=48,  #(43,44,45,47,48,49,50,51),
-        bandwidth=0.26,  #[i / 100 for i in range(24, 39, 2)], #[0.4, 0.45, 0.45],
-        thresh=-0.54,  #[-i / 100 for i in range(50, 59, 2)], #[-0.45, -0.5, -0.55],
-        allow_short=True,
-        tp_mult=2.2, #[i / 10 for i in range(20, 25)],  #[1.7, 1.8, 1.9, 2],
-        printlog=False
-    )
-        
-        params = dict(  # RTS_1h  - final 07-05-26, для 1 год - 670_375, для 4 - 1_044_848 плохо !
-        write_history=True,
-        risk=5,
-        window=36,  #range(31, 44),
-        bandwidth=0.21,  #[i / 100 for i in range(19, 24)],  # [0.4, 0.45, 0.45],
-        thresh=-0.48,  #[-i / 100 for i in range(48, 53)],  # [-0.45, -0.5, -0.55],
-        allow_short=True,
-        tp_mult=1.2,  #[i / 10 for i in range(12, 15)],  # [1.7, 1.8, 1.9, 2],
-        printlog=False
-    )
-    )
-'''
+    main(available_cpus, settings=RUN_SETTINGS)
