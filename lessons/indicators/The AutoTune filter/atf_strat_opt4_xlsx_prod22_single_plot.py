@@ -19,7 +19,7 @@ from statistics import mean, stdev
 import xlsxwriter
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from tqdm import tqdm
-from additional_plotting import save_best_equity_dd_plot
+from additional_plotting_prod21_fix import save_best_equity_dd_plot
 
 _OPT_PBAR = None
 
@@ -69,6 +69,13 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           входные настройки запуска перенесены вниз скрипта и передаются в main().
 # 19-05-26 prod20: исправлен sizing входного bracket-ордера с учётом комиссии,
 #           добавлены диагностические листы orders и signals.
+# 19-05-26 prod21: добавлен режим instrument_type='futures'/'stocks'.
+# 20-05-26 prod21-fix: усилено формирование Equity/DD PNG для stock-режима.
+# 20-05-26 prod22: упрощён лист results — убраны e-Pardo/s-Pardo и
+#           оставлены только MaxDDPct/MaxDDMoney как основные DD-метрики.
+#           Скрипт умеет запускаться как по фьючерсным сериям MOEX, так и по акциям MOEX.
+# 21-05-26 prod22-single-plot: добавлен режим run_mode='single_plot' —
+#           один набор параметров запускается через addstrategy(), затем график открывается через CerebroView.
 # 19-05-26 prod19-fix: исправлен MaxClosedDDPct и добавлен внешний модуль additional_plotting.py
 #           для сохранения PNG-графика closed Equity/DD.
 
@@ -92,12 +99,23 @@ class FuturesCommission(bt.CommInfoBase):
 # Класс для расчета комиссии при работе с Акциями
 class StockCommission(bt.CommInfoBase):
     params = dict(
-        moexcomm=0,  # Комиссии Биржи в % от покупки/продажи (0.03%)
-        brokercomm=0  # Комиссии Брокера в % от покупки/продажи (0.03%)
+        # ВАЖНО: комиссии задаются десятичной долей, а не процентом.
+        # Например, 0.03% = 0.0003.
+        moexcomm=0.0003,
+        brokercomm=0.0003,
+        cost_of_price_step=0.01,
     )
 
     def _getcommission(self, size, price, pseudoexec):
         return abs(size) * price * (self.p.moexcomm + self.p.brokercomm)
+
+
+stocks_comm = dict(
+    # Универсальный дефолт для акций MOEX. При необходимости для конкретной
+    # акции можно добавить отдельную запись с другим шагом цены или комиссией:
+    # SBER=StockCommission(moexcomm=0.0003, brokercomm=0.0003, cost_of_price_step=0.01)
+    DEFAULT=StockCommission(moexcomm=0.0003, brokercomm=0.0003, cost_of_price_step=0.01),
+)
 
 
 futures_comm = dict( # Комиссии для фьючерсов
@@ -244,6 +262,117 @@ def expand_param_combinations(params_dict):
 
     for combo in product(*values):
         yield dict(zip(keys, combo))
+
+
+def normalize_instrument_type(instrument_type):
+    """Приводит тип инструмента к одному из значений: futures / stocks."""
+    value = str(instrument_type or 'futures').lower().strip()
+
+    if value in ('future', 'futures', 'fut'):
+        return 'futures'
+
+    if value in ('stock', 'stocks', 'share', 'shares', 'equity', 'equities'):
+        return 'stocks'
+
+    raise ValueError("instrument_type должен быть 'futures' или 'stocks'")
+
+
+def as_list(value):
+    """Позволяет передавать sec как строку или как список тикеров."""
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+
+    return [value]
+
+
+def get_commission_info(sec, instrument_type, settings=None):
+    """Возвращает commission-info для фьючерса или акции."""
+    instrument_type = normalize_instrument_type(instrument_type)
+    settings = settings or {}
+
+    if instrument_type == 'futures':
+        if sec not in futures_comm:
+            raise KeyError(
+                f"Для фьючерса '{sec}' нет записи в futures_comm. "
+                f"Добавьте ГО, мультипликатор, биржевую комиссию и шаг цены."
+            )
+        return futures_comm[sec]
+
+    if sec in stocks_comm:
+        return stocks_comm[sec]
+
+    return StockCommission(
+        moexcomm=float(settings.get('stock_moexcomm', stocks_comm['DEFAULT'].p.moexcomm)),
+        brokercomm=float(settings.get('stock_brokercomm', stocks_comm['DEFAULT'].p.brokercomm)),
+        cost_of_price_step=float(settings.get('stock_price_step', stocks_comm['DEFAULT'].p.cost_of_price_step)),
+    )
+
+
+def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
+    """
+    Загружает данные MOEX.
+
+    futures:
+        sec = базовый код фьючерса, например SPYF / RTS / MIX.
+        Скрипт сам находит серии через store.futures.contracts_between().
+
+    stocks:
+        sec = тикер акции или список тикеров, например 'SBER' или ['SBER', 'GAZP'].
+        Данные загружаются напрямую, без логики контрактов и экспираций.
+    """
+    instrument_type = normalize_instrument_type(instrument_type)
+    datas = []
+
+    if instrument_type == 'futures':
+        contracts = store.futures.contracts_between(sec, start_date, end_date)
+        print(contracts)
+
+        for contract in contracts:
+            prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
+
+            if contract == contracts[0]:
+                fromdate = pd.to_datetime(start_date) - timedelta(days=5)
+            else:
+                fromdate = prevexpdate - timedelta(days=5)
+
+            contract_expdate = pd.to_datetime(store.futures.expdate(contract)).date()
+
+            if contract == contracts[-1]:
+                todate = end_date
+            else:
+                todate = store.futures.expdate(contract)
+
+            data = store.getdata(
+                sec_id=contract,
+                fromdate=fromdate,
+                todate=todate,
+                tf=tf,
+                name=contract,
+            )
+
+            data.sec = sec
+            data.contract_expdate = contract_expdate
+            datas.append(data)
+
+        return datas, contracts
+
+    stock_tickers = as_list(sec)
+    print(stock_tickers)
+
+    for ticker in stock_tickers:
+        data = store.getdata(
+            sec_id=ticker,
+            fromdate=start_date,
+            todate=end_date,
+            tf=tf,
+            name=ticker,
+        )
+
+        data.sec = ticker
+        data.contract_expdate = None
+        datas.append(data)
+
+    return datas, stock_tickers
 
 
 def calc_max_drawdown_from_values(values):
@@ -1312,6 +1441,132 @@ class AutoTuneFilterEhlersStrategy(AutoTuneFilterStrategy):
                 self._submit_ehlers_target(isbuy=True)
 
 
+
+def to_single_strategy_params(params):
+    """
+    Для режима single_plot превращает словарь параметров в один конкретный набор.
+
+    В этом режиме стратегия запускается через addstrategy(), поэтому каждый
+    параметр должен быть одиночным значением. Если случайно передан список/range,
+    берём первый элемент и печатаем предупреждение.
+    """
+    single_params = {}
+
+    for key, value in params.items():
+        if isinstance(value, range):
+            value_list = list(value)
+            if not value_list:
+                raise ValueError(f"Параметр {key} задан пустым range")
+            print(f"[single_plot] {key}: получен range, беру первое значение {value_list[0]}")
+            single_params[key] = value_list[0]
+
+        elif isinstance(value, (list, tuple, set)):
+            value_list = list(value)
+            if not value_list:
+                raise ValueError(f"Параметр {key} задан пустым списком/кортежем/set")
+            print(f"[single_plot] {key}: получен набор значений, беру первое значение {value_list[0]}")
+            single_params[key] = value_list[0]
+
+        else:
+            single_params[key] = value
+
+    return single_params
+
+
+def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_mode,
+                    close_on_expiration, expiration_exit_bar):
+    """
+    Запускает один прогон через cerebro.addstrategy() и показывает результат через CerebroView.
+
+    Это режим не для оптимизации, а для визуального разбора сделок:
+    - один инструмент / один data feed;
+    - один конкретный набор параметров;
+    - после cerebro.run() вызывается plot(cerebro).
+    """
+    if not datas:
+        raise ValueError("Нет загруженных данных для single_plot")
+
+    plot_data_name = settings.get('plot_data_name')
+    plot_data_index = int(settings.get('plot_data_index', 0))
+
+    if plot_data_name:
+        selected = [data for data in datas if str(data.p.name) == str(plot_data_name)]
+        if not selected:
+            raise ValueError(f"plot_data_name='{plot_data_name}' не найден среди загруженных datas")
+        data = selected[0]
+    else:
+        if plot_data_index < 0 or plot_data_index >= len(datas):
+            raise IndexError(f"plot_data_index={plot_data_index} вне диапазона datas: 0..{len(datas) - 1}")
+        data = datas[plot_data_index]
+
+    strategy_params = dict(
+        to_single_strategy_params(params),
+        close_on_expiration=close_on_expiration,
+        expiration_exit_bar=expiration_exit_bar,
+        contract_expdate=data.contract_expdate,
+    )
+
+    strategy_cls = AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
+
+    cerebro = bt.Cerebro(stdstats=False)
+    cerebro.broker = bt.brokers.BackBroker()
+    cerebro.broker.setcash(start_cash)
+    cerebro.broker.addcommissioninfo(
+        get_commission_info(data.sec, instrument_type, settings),
+        name=data.p.name,
+    )
+
+    cerebro.adddata(data)
+    cerebro.addstrategy(strategy_cls, **strategy_params)
+
+    # Анализаторы оставляем, чтобы при необходимости можно было быстро
+    # посмотреть результат прогона в консоли.
+    analyzer_params = dict(
+        it_params=iterable_params(strategy_params),
+        asset=data.sec,
+    )
+    cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
+
+    print(
+        f"[single_plot] Запуск {data.p.name} | instrument_type={instrument_type} | "
+        f"exit_mode={exit_mode} | start_cash={start_cash:.2f}"
+    )
+    print(f"[single_plot] params={strategy_params}")
+
+    results = cerebro.run(
+        stdstats=False,
+        tradehistory=bool(strategy_params.get("write_history", True)),
+        maxcpus=1,
+    )
+
+    strategy = results[0]
+    analysis = dict(strategy.analyzers.full.get_analysis())
+    add_drawdown_metrics(strategy, analysis)
+
+    print(
+        f"[single_plot] EndValue={analysis.get('EndValue', cerebro.broker.getvalue()):.2f} | "
+        f"PNL={analysis.get('ContractPNL', 0):.2f} | "
+        f"WinTr={analysis.get('WinTr', 0)} | LossTr={analysis.get('LossTr', 0)} | "
+        f"MaxDDPct={analysis.get('MaxDDPct', 0):.2f} | "
+        f"MaxDDMoney={analysis.get('MaxDDMoney', 0):.2f}"
+    )
+
+    try:
+        from cerebroview import plot as cerebroview_plot
+    except ImportError as exc:
+        raise ImportError(
+            "Не удалось импортировать CerebroView. Убедитесь, что пакет/папка cerebroview "
+            "доступна из текущего проекта. Для режима single_plot нужен импорт: "
+            "from cerebroview import plot"
+        ) from exc
+
+    plot_kwargs = settings.get('cerebroview_plot_kwargs') or {}
+    cerebroview_plot(cerebro, **plot_kwargs)
+
+    return results
+
+
 def main(maxcpus=None, settings=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     global _OPT_PBAR
@@ -1320,6 +1575,8 @@ def main(maxcpus=None, settings=None):
         raise ValueError('settings must be provided')
 
     start_cash = float(settings.get('start_cash', 300000.0))
+    instrument_type = normalize_instrument_type(settings.get('instrument_type', 'futures'))
+    run_mode = str(settings.get('run_mode', 'optimize')).lower().strip()
     capital_mode = settings.get('capital_mode', 'fixed')
     exit_mode = settings.get('exit_mode', 'bracket')
     close_on_expiration = bool(settings.get('close_on_expiration', True))
@@ -1337,46 +1594,40 @@ def main(maxcpus=None, settings=None):
 
     total_time = _time.time()
     store = MoexStore()
-    datas = list()
 
-    # for sec in futures:
-    contracts = store.futures.contracts_between(sec, start_date, end_date)
-    print(contracts)
+    datas, loaded_items = load_moex_datas(
+        store=store,
+        sec=sec,
+        instrument_type=instrument_type,
+        start_date=start_date,
+        end_date=end_date,
+        tf=tf,
+    )
 
     variants = count_param_variants(params)
 
-    sheet_size = (variants * len(contracts)) > 1048576
+    sheet_size = (variants * len(datas)) > 1048576
     if sheet_size:
-        print(f"Excel sheet is too large! Your sheet size is: {variants * len(contracts)}, Max sheet size is: 1'048'576")
+        print(f"Excel sheet is too large! Your sheet size is: {variants * len(datas)}, Max sheet size is: 1'048'576")
+
+    item_name = 'контрактов' if instrument_type == 'futures' else 'инструментов'
     print(f'Рассчитываем {variants} вариантов стратегии для '
-          f'каждого из {len(contracts)} контрактов. Итого '
-          f'{variants * len(contracts)} вариантов.')
+          f'каждого из {len(datas)} {item_name}. Итого '
+          f'{variants * len(datas)} вариантов.')
     print(f'Время пошло, {datetime.now():%H:%M:%S}')
 
-    for contract in contracts:
-        prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
-
-        if contract == contracts[0]:
-            fromdate = pd.to_datetime(start_date) - timedelta(days=5)
-            # start_trades = pd.to_datetime(start_date)
-        else:
-            fromdate = prevexpdate - timedelta(days=5)
-            # start_trades = prevexpdate
-        contract_expdate = pd.to_datetime(store.futures.expdate(contract)).date()
-
-        if contract == contracts[-1]:
-            todate = end_date
-        else:
-            todate = store.futures.expdate(contract)
-
-        data = store.getdata(sec_id=contract,
-                                   fromdate=fromdate,
-                                   todate=todate,
-                                   tf=tf, name=contract)
-
-        data.sec = sec
-        data.contract_expdate = contract_expdate
-        datas.append(data)
+    if run_mode in ('single_plot', 'single', 'plot'):
+        run_single_plot(
+            settings=settings,
+            datas=datas,
+            instrument_type=instrument_type,
+            params=params,
+            start_cash=start_cash,
+            exit_mode=exit_mode,
+            close_on_expiration=close_on_expiration,
+            expiration_exit_bar=expiration_exit_bar,
+        )
+        return
 
     results = []
     trades = []
@@ -1400,7 +1651,7 @@ def main(maxcpus=None, settings=None):
             cerebro = bt.Cerebro()
             cerebro.broker = bt.brokers.BackBroker()
             cerebro.broker.setcash(start_cash)
-            cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
+            cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type, settings), name=data.p.name)
             cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
             cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
             cerebro.adddata(data)
@@ -1495,7 +1746,7 @@ def main(maxcpus=None, settings=None):
                 cerebro = bt.Cerebro()
                 cerebro.broker = bt.brokers.BackBroker()
                 cerebro.broker.setcash(current_cash)
-                cerebro.broker.addcommissioninfo(futures_comm[data.sec], name=data.p.name)
+                cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type, settings), name=data.p.name)
                 cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
                 cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
                 cerebro.adddata(data)
@@ -1576,9 +1827,24 @@ def main(maxcpus=None, settings=None):
         df_orders = pd.DataFrame(orders).round(3)
         df_signals = pd.DataFrame(signals).round(6)
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
+
+    # Упрощаем итоговую вкладку results:
+    # - e-Pardo/s-Pardo оставляем внутренними расчётными метриками, но не выводим;
+    # - по DD оставляем только общепринятую максимальную просадку по broker value.
+    #   MaxClosedDD* остаётся диагностикой по закрытым сделкам и в results не выводится.
+    results_drop_cols = [
+        'e-Pardo',
+        's-Pardo',
+        'MaxDDLen',
+        'MaxClosedDDMoney',
+        'MaxClosedDDPct',
+    ]
+    df3 = df3.drop(columns=[col for col in results_drop_cols if col in df3.columns])
     df4 = pd.DataFrame(
         list(params.items()) + [
             ('start_cash', start_cash),
+            ('instrument_type', instrument_type),
+            ('run_mode', run_mode),
             ('capital_mode', capital_mode),
             ('exit_mode', exit_mode),
             ('close_on_expiration', close_on_expiration),
@@ -1628,46 +1894,113 @@ def main(maxcpus=None, settings=None):
 
     if plot_file:
         print(f"Сохранён график Equity/DD: '{plot_file}'.")
+    elif save_equity_dd_plot:
+        if not params['write_history']:
+            print("График Equity/DD не сформирован: write_history=False, нет журнала сделок.")
+        elif 'df2' not in locals() or df2.empty:
+            print("График Equity/DD не сформирован: нет закрытых сделок в df2/trades.")
+        else:
+            print(
+                "График Equity/DD не сформирован: не удалось сопоставить лучший "
+                "вариант из results с записями trades. Проверьте колонки params/sec."
+            )
 
     os.startfile(results_file)
 
 
 
 if __name__ == '__main__':
-    STRATEGY_PARAMS = dict(
+    STRATEGY_PARAMS111 = dict( #SBER
         write_history=True,
-        risk=5,
-        window=60,
-        bandwidth=0.28,
-        thresh=-0.4,
+        risk=10,
+        window=55,
+        bandwidth=0.3,
+        thresh=-0.45,
+        allow_short=False,
+        printlog=False,
+        tp_mult=0.5,  #0.2,
+        min_dc=25,
+    )
+
+    STRATEGY_PARAMS111 = dict(  #SBRF
+        write_history=True,
+        risk=10,
+        window=65,
+        bandwidth=0.35,
+        thresh=-0.55,
         allow_short=True,
         printlog=False,
-        tp_mult=1.5,
+        tp_mult=0.5,  #0.2,
         min_dc=25,
+    )
+
+    STRATEGY_PARAMS = dict(
+        write_history=False,
+        risk=range(4,7),
+        window=range(65,68),
+        bandwidth=[i / 100 for i in range(50, 61, 10)],
+        thresh=[-i / 100 for i in range(50, 66, 5)],
+        allow_short=True,
+        printlog=False,
+        tp_mult=[i / 10 for i in range(15, 19)],
+        min_dc=range(25,46,5),
+    )
+
+    STRATEGY_PARAMS111 = dict(  #GAZP
+        write_history=False,
+        risk=10,
+        window=range(55,96,5),
+        bandwidth=[i / 100 for i in range(15, 41, 5)],
+        thresh=-0.45,  #[-i / 100 for i in range(40, 71, 5)],
+        allow_short=False,
+        printlog=False,
+        tp_mult=(0.5, 1, 1.2), #[i / 10 for i in range(2, 13, 2)],
+        min_dc=25,  #(0, 25),
     )
 
     RUN_SETTINGS = dict(
         start_cash=300000.0,
 
-        # fixed      — каждый контракт запускается с одинакового start_cash.
+        # futures — фьючерсы MOEX: sec задаёт базовый код, серии подбираются автоматически.
+        # stocks  — акции MOEX: sec задаёт тикер акции или список тикеров, без экспираций.
+        instrument_type='futures',
+
+        # optimize    — обычная оптимизация / прогон с записью Excel;
+        # single_plot — один набор параметров через addstrategy() и просмотр сделок в CerebroView.
+        run_mode='optimize',
+
+        # Для single_plot, если загружено несколько datas:
+        # - plot_data_index выбирает data по индексу;
+        # - plot_data_name выбирает data по имени, если задан.
+        plot_data_index=0,
+        plot_data_name=None,
+        cerebroview_plot_kwargs={},
+
+        # fixed      — каждый контракт/инструмент запускается с одинакового start_cash.
         # cumulative — капитал переносится от контракта к контракту отдельно
         #              для каждой комбинации параметров.
-        capital_mode='cumulative',
+        capital_mode='fixed',
 
         # bracket — текущая рабочая логика: stop-loss / take-profit.
         # ehlers  — выход/разворот по обратному сигналу ATF из статьи Эйлерса.
         exit_mode='bracket',
 
+        # Для stocks эти параметры игнорируются, потому что contract_expdate=None.
         close_on_expiration=True,
         expiration_exit_bar=3,
+
+        # Настройки комиссии для stock-режима. Значения задаются долей: 0.0003 = 0.03%.
+        stock_moexcomm=0.0003,
+        stock_brokercomm=0.0003,
+        stock_price_step=0.01,
 
         params=STRATEGY_PARAMS,
         tf='1h',
         start_date='2023-6-20',
         end_date=datetime.today(),
         main_opt_metric='PROM',
-        sec='SPYF',
-        save_equity_dd_plot=True,
+        sec='SBRF',  # 'SBER' 'GAZP'  'SBRF'
+        save_equity_dd_plot=False,
         equity_dd_plot_freq='M',  # месячные столбцы Equity/DD
     )
 
