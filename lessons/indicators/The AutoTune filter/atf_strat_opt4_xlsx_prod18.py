@@ -61,6 +61,10 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           и больше не открывает новые сделки в этот день.
 #           Добавлены метрики максимальной просадки через bt.analyzers.DrawDown:
 #           MaxDDPct, MaxDDMoney, MaxDDLen.
+# 18-05-26 prod18: добавлен переключатель exit_mode:
+#           'bracket' — текущий выход через stop-loss и take-profit в R;
+#           'ehlers'  — выход/разворот по обратному сигналу AutoTune Filter
+#                       по логике Code Listing 2 из статьи Эйлерса.
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -527,7 +531,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
         thresh=-0.22,
         allow_short=True,
         printlog=False,
-        tp_mult=2.0,   # тейк-профит в R
+        tp_mult=2.0,   # тейк-профит в R для exit_mode='bracket'
+        exit_mode='bracket',  # 'bracket' — SL/TP; 'ehlers' — выход/разворот по обратному сигналу ATF
         close_on_expiration=True,  # закрывать открытую позицию в день экспирации контракта
         expiration_exit_bar=3,     # номер бара дня экспирации, на котором отправляем close()
         contract_expdate=None,     # дата экспирации текущего контракта; передаётся из main()
@@ -725,6 +730,85 @@ class AutoTuneFilterStrategy(bt.Strategy):
             f'TP({self.p.tp_mult}R)={self.take_profit_price:.2f}'
         )
 
+    def _calc_ehlers_target_size(self):
+        """
+        Рассчитывает целевой размер позиции для режима exit_mode='ehlers'.
+
+        В этом режиме нет stop-loss/take-profit bracket-ордера. Стратегия
+        входит по сигналу Эйлерса и при обратном сигнале разворачивается в
+        противоположную сторону. Для размера позиции используем текущую
+        стоимость счёта: при развороте это адекватнее, чем broker.getcash(),
+        потому что часть средств уже занята маржой открытой позиции.
+        """
+        comminfo = self.broker.getcommissioninfo(self.data)
+        account_value = self.broker.getvalue()
+        self.entry_price = self.data.close[0]
+
+        if self.entry_price <= 0:
+            return 0
+
+        if comminfo.p.margin:
+            max_size = account_value / comminfo.p.margin
+        else:
+            max_size = account_value / self.entry_price
+
+        size = int(max_size) - 1
+        return max(size, 0)
+
+    def _submit_ehlers_target(self, isbuy):
+        """
+        Отправляет ордер к целевой позиции по логике Эйлерса.
+
+        - long signal  -> целевая позиция +size
+        - short signal -> целевая позиция -size
+
+        Если стратегия уже стоит в противоположной позиции, один рыночный
+        ордер закрывает текущую позицию и открывает новую в другую сторону.
+        Это ближе к Pro Forma always-in-the-market логике оригинальной статьи,
+        чем последовательное close() и ожидание нового сигнала.
+        """
+        # Повторный сигнал в сторону уже открытой позиции не должен
+        # пересчитывать/наращивать размер позиции. В оригинальной идее
+        # значимым событием для выхода является противоположный сигнал.
+        if self.position.size > 0 and isbuy:
+            return
+        if self.position.size < 0 and not isbuy:
+            return
+
+        target_size = self._calc_ehlers_target_size()
+        if target_size <= 0:
+            return
+
+        target_position = target_size if isbuy else -target_size
+        delta = target_position - self.position.size
+
+        if delta == 0:
+            return
+
+        side = 'long' if delta > 0 else 'short'
+        action = 'BUY' if delta > 0 else 'SELL'
+        size = abs(delta)
+
+        self.log(
+            f'EHLERS {action} SIGNAL -> target={target_position}, '
+            f'current={self.position.size}, order_size={size}'
+        )
+
+        if delta > 0:
+            self.order = self.buy(size=size, name=side)
+        else:
+            self.order = self.sell(size=size, name=side)
+
+    def _submit_ehlers_close(self):
+        """Закрывает позицию по обратному сигналу без разворота."""
+        if not self.position:
+            return
+        if self.order is not None and self.order.alive():
+            return
+
+        self.log('EHLERS EXIT -> close()')
+        self.order = self.close(name='ehlers_exit')
+
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
             return
@@ -747,6 +831,9 @@ class AutoTuneFilterStrategy(bt.Strategy):
             elif order_name == 'expiration_close':
                 self.log(f'EXPIRATION CLOSE EXECUTED at {order.executed.price:.2f}')
                 self._reset_bracket_state()
+            elif order_name == 'ehlers_exit':
+                self.log(f'EHLERS EXIT EXECUTED at {order.executed.price:.2f}')
+                self.order = None
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
             self.log(f'ORDER {order_name} FAILED: {order.getstatusname()}')
@@ -759,6 +846,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 self.take_profit_order = None
             elif order_name == 'expiration_close':
                 self.expiration_close_order = None
+            elif order_name == 'ehlers_exit':
+                self.order = None
 
     def next(self):
         self._update_session_bar_no()
@@ -771,13 +860,43 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 self._submit_expiration_close()
             return
 
-        if self.position or self._has_active_orders():
-            return
+        exit_mode = str(self.p.exit_mode).lower()
+        if exit_mode not in ('bracket', 'ehlers'):
+            raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
 
-        if self.long_signal[0]:
-            self._submit_bracket(isbuy=True)
-        elif self.p.allow_short and self.short_signal[0]:
-            self._submit_bracket(isbuy=False)
+        if exit_mode == 'bracket':
+            # Моя доработанная логика: вход по ATF, выход через SL/TP bracket.
+            if self.position or self._has_active_orders():
+                return
+
+            if self.long_signal[0]:
+                self._submit_bracket(isbuy=True)
+            elif self.p.allow_short and self.short_signal[0]:
+                self._submit_bracket(isbuy=False)
+
+        else:
+            # Оригинальная Pro Forma логика Эйлерса: входы и выходы/развороты
+            # происходят по обратным сигналам ROC относительно нуля.
+            # В этом режиме stop-loss/take-profit bracket-ордера не используются.
+            if self._has_active_orders():
+                return
+
+            if not self.position:
+                if self.long_signal[0]:
+                    self._submit_ehlers_target(isbuy=True)
+                elif self.p.allow_short and self.short_signal[0]:
+                    self._submit_ehlers_target(isbuy=False)
+
+            elif self.position.size > 0:
+                if self.short_signal[0]:
+                    if self.p.allow_short:
+                        self._submit_ehlers_target(isbuy=False)
+                    else:
+                        self._submit_ehlers_close()
+
+            elif self.position.size < 0:
+                if self.long_signal[0]:
+                    self._submit_ehlers_target(isbuy=True)
 
 
 
@@ -789,7 +908,7 @@ def main(maxcpus=None):
 
     # fixed      — каждый контракт запускается с одинакового start_cash (как в предыдущих версиях).
     # cumulative — капитал переносится от контракта к контракту отдельно для каждой комбинации параметров.
-    capital_mode = 'cumulative'  # 'fixed' или 'cumulative'
+    capital_mode = 'fixed'  # 'fixed' или 'cumulative'
 
     # Если True, то в день экспирации стратегия не открывает новые сделки.
     # Если позиция уже открыта, на expiration_exit_bar-м баре дня экспирации
@@ -801,13 +920,17 @@ def main(maxcpus=None):
     # params = dict( # MIX
     #     write_history=True,
     #     risk=5,
-    #     window=range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+    #     window=50, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
     #     bandwidth=0.34,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
     #     thresh=-0.48,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
     #     allow_short=True,
     #     printlog=False,
-    #     tp_mult=1.7,  #[i / 10 for i in range(12, 23)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-    #     min_dc=35,  #range(5,36,5),
+    #     exit_mode='bracket',  # 'bracket' — SL/TP; 'ehlers' — выход/разворот по обратному сигналу ATF
+    #     # Для exit_mode='ehlers' параметр tp_mult не используется.
+    #     # Если включаете ehlers-режим, лучше задать tp_mult одним числом, а не списком,
+    #     # чтобы не плодить одинаковые варианты оптимизации.
+    #     tp_mult=[i / 10 for i in range(12, 23)],  # тейк-профит в R для exit_mode='bracket'
+    #     min_dc=range(5,36,5),
     # )
 
     params = dict( # RTS
@@ -818,6 +941,7 @@ def main(maxcpus=None):
         thresh=-0.48,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
         allow_short=True,
         printlog=False,
+        exit_mode='bracket',  # 'bracket' — SL/TP; 'ehlers' — выход/разворот по обратному сигналу ATF
         tp_mult=1.2,  #[i / 10 for i in range(12, 23)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
         min_dc=0, #range(10,36,5), #35,  #range(5,36,5), #
     )

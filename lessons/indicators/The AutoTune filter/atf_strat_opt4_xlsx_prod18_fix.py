@@ -61,6 +61,9 @@ SCRIPT_VERSION = SCRIPT_VERSION_MATCH.group(1).lower() if SCRIPT_VERSION_MATCH e
 #           и больше не открывает новые сделки в этот день.
 #           Добавлены метрики максимальной просадки через bt.analyzers.DrawDown:
 #           MaxDDPct, MaxDDMoney, MaxDDLen.
+# 18-05-26 prod18-fix: добавлен режим выхода по Эйлерсу отдельным классом
+#           AutoTuneFilterEhlersStrategy. Bracket-режим оставлен на исходном
+#           классе AutoTuneFilterStrategy без изменения логики prod17.
 
 FUTURE_TYPE = dict(     # Базовая ставка комиссии Биржи
     currency=0.00462,   # Валютные контракты
@@ -780,6 +783,133 @@ class AutoTuneFilterStrategy(bt.Strategy):
             self._submit_bracket(isbuy=False)
 
 
+class AutoTuneFilterEhlersStrategy(AutoTuneFilterStrategy):
+    """
+    Вариант стратегии с выходом/разворотом по оригинальной логике Эйлерса.
+
+    Базовый класс AutoTuneFilterStrategy в prod17 оставлен для bracket-режима
+    без изменения логики. Этот отдельный класс нужен, чтобы режим bracket давал
+    те же результаты, что и prod17, а эксперимент с выходом по Эйлерсу не влиял
+    на текущий рабочий алгоритм.
+    """
+
+    def _calc_ehlers_target_size(self):
+        """
+        Рассчитывает целевой размер позиции для always-in-the-market логики.
+
+        Здесь нет SL/TP bracket-ордера. При обратном сигнале стратегия должна
+        перейти к противоположной позиции. Размер считаем от текущей стоимости
+        счёта, а не только от свободного cash, потому что при развороте часть
+        средств уже занята маржой открытой позиции.
+        """
+        comminfo = self.broker.getcommissioninfo(self.data)
+        account_value = self.broker.getvalue()
+        self.entry_price = self.data.close[0]
+
+        if self.entry_price <= 0:
+            return 0
+
+        if comminfo.p.margin:
+            max_size = account_value / comminfo.p.margin
+        else:
+            max_size = account_value / self.entry_price
+
+        size = int(max_size) - 1
+        return max(size, 0)
+
+    def _submit_ehlers_target(self, isbuy):
+        """
+        Отправляет ордер к целевой позиции по логике Эйлерса.
+
+        Long signal  -> целевая позиция +size.
+        Short signal -> целевая позиция -size.
+
+        Если уже открыта противоположная позиция, один рыночный ордер закрывает
+        текущую позицию и открывает новую в другую сторону.
+        """
+        if self.position.size > 0 and isbuy:
+            return
+        if self.position.size < 0 and not isbuy:
+            return
+
+        target_size = self._calc_ehlers_target_size()
+        if target_size <= 0:
+            return
+
+        target_position = target_size if isbuy else -target_size
+        delta = target_position - self.position.size
+
+        if delta == 0:
+            return
+
+        side = 'long' if delta > 0 else 'short'
+        action = 'BUY' if delta > 0 else 'SELL'
+        size = abs(delta)
+
+        self.log(
+            f'EHLERS {action} SIGNAL -> target={target_position}, '
+            f'current={self.position.size}, order_size={size}'
+        )
+
+        if delta > 0:
+            self.order = self.buy(size=size, name=side)
+        else:
+            self.order = self.sell(size=size, name=side)
+
+    def _submit_ehlers_close(self):
+        """Закрывает позицию по обратному сигналу без разворота в short."""
+        if not self.position:
+            return
+        if self.order is not None and self.order.alive():
+            return
+
+        self.log('EHLERS EXIT -> close()')
+        self.order = self.close(name='ehlers_exit')
+
+    def notify_order(self, order):
+        super().notify_order(order)
+
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        order_name = getattr(order.info, 'name', None)
+
+        if order_name == 'ehlers_exit':
+            if order.status == order.Completed:
+                self.log(f'EHLERS EXIT EXECUTED at {order.executed.price:.2f}')
+            self.order = None
+
+    def next(self):
+        self._update_session_bar_no()
+
+        # В день экспирации не открываем новые сделки. Если позиция была
+        # перенесена в этот день, на заданном баре отправляем рыночный close().
+        if self.p.close_on_expiration and self._is_expiration_day():
+            if self._is_after_expiration_exit_bar():
+                self._submit_expiration_close()
+            return
+
+        if self._has_active_orders():
+            return
+
+        if not self.position:
+            if self.long_signal[0]:
+                self._submit_ehlers_target(isbuy=True)
+            elif self.p.allow_short and self.short_signal[0]:
+                self._submit_ehlers_target(isbuy=False)
+
+        elif self.position.size > 0:
+            if self.short_signal[0]:
+                if self.p.allow_short:
+                    self._submit_ehlers_target(isbuy=False)
+                else:
+                    self._submit_ehlers_close()
+
+        elif self.position.size < 0:
+            if self.long_signal[0]:
+                self._submit_ehlers_target(isbuy=True)
+
+
 
 def main(maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
@@ -791,6 +921,13 @@ def main(maxcpus=None):
     # cumulative — капитал переносится от контракта к контракту отдельно для каждой комбинации параметров.
     capital_mode = 'cumulative'  # 'fixed' или 'cumulative'
 
+    # Режим выхода:
+    # 'bracket' — текущая логика prod17: выход через stop-loss/take-profit.
+    # 'ehlers'  — выход/разворот по обратному сигналу ATF из статьи Эйлерса.
+    # Важно: в режиме 'bracket' используется исходный класс AutoTuneFilterStrategy
+    # без изменения логики prod17.
+    exit_mode = 'ehlers'
+
     # Если True, то в день экспирации стратегия не открывает новые сделки.
     # Если позиция уже открыта, на expiration_exit_bar-м баре дня экспирации
     # отправляется рыночный close(). При стандартном исполнении Backtrader
@@ -801,13 +938,16 @@ def main(maxcpus=None):
     # params = dict( # MIX
     #     write_history=True,
     #     risk=5,
-    #     window=range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
+    #     window=50, #range(45,56, 5),   #28,  #range(48,53, 2),   #28,  #[48, 49, 50],  #range(16,57),  #30,
     #     bandwidth=0.34,  #[i / 100 for i in range(20, 32)], #[0.3, 0.35, 0.4], #[i / 100 for i in range(30, 56, 5)], #0.46,  #, #[0.4, 0.45, 0.45],[0.34, 0.35, 0.36],  # [i/100 for i in range(30, 51, 2)],  #[0.16, 0.24, 0.32, 0.4], # 0.22, #
     #     thresh=-0.48,  #[-i / 100 for i in range(40, 51, 2)],  #-0.5,  #[-i / 100 for i in range(25, 56, 5)],  #-0.68,  #-0.7,  #[-0.48, -0.49, 0.50],  #[-i/100 for i in range(42, 55, 2)],  #[-i / 12.5 for i in range(4, 9)],  #[0.32, 0.4, 0.48, 0.56, 0.64], #
     #     allow_short=True,
     #     printlog=False,
-    #     tp_mult=1.7,  #[i / 10 for i in range(12, 23)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
-    #     min_dc=35,  #range(5,36,5),
+    #     # Для exit_mode='ehlers' параметр tp_mult не используется.
+    #     # Если включаете ehlers-режим, лучше задать tp_mult одним числом,
+    #     # чтобы не плодить одинаковые варианты оптимизации.
+    #     tp_mult=[i / 10 for i in range(12, 23)],  #1.8,  #[i / 10 for i in range(15, 22, 3)],  #1.8,  #1.5,  #[1+i/10 for i in range(1,7)],   # тейк-профит в R
+    #     min_dc=range(5,36,5),
     # )
 
     params = dict( # RTS
@@ -879,6 +1019,12 @@ def main(maxcpus=None):
     if capital_mode not in ('fixed', 'cumulative'):
         raise ValueError("capital_mode должен быть 'fixed' или 'cumulative'")
 
+    exit_mode = str(exit_mode).lower()
+    if exit_mode not in ('bracket', 'ehlers'):
+        raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
+
+    strategy_cls = AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
+
     if capital_mode == 'fixed':
         # Старый режим: каждый контракт тестируется независимо и стартует
         # с одинакового депозита start_cash.
@@ -899,7 +1045,7 @@ def main(maxcpus=None):
                 expiration_exit_bar=expiration_exit_bar,
                 contract_expdate=data.contract_expdate,
             )
-            cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
+            cerebro.optstrategy(strategy_cls, **strategy_params)
             if tqdm is not None:
                 _OPT_PBAR = tqdm(
                     total=variants,
@@ -926,12 +1072,14 @@ def main(maxcpus=None):
                     analysis['PNLs'] = analyzer.get_trades_pnl()
                     analysis['Asset'] = data.sec
                     analysis['CapitalMode'] = capital_mode
+                    analysis['ExitMode'] = exit_mode
                     results.append(analysis)
 
                     if params['write_history']:
                         trades_data = analyzer.get_trades()
                         for tr in trades_data:
                             tr['capital_mode'] = capital_mode
+                            tr['exit_mode'] = exit_mode
                         trades.extend(trades_data)
 
             print(
@@ -980,7 +1128,7 @@ def main(maxcpus=None):
                     expiration_exit_bar=expiration_exit_bar,
                     contract_expdate=data.contract_expdate,
                 )
-                cerebro.addstrategy(AutoTuneFilterStrategy, **run_strategy_params)
+                cerebro.addstrategy(strategy_cls, **run_strategy_params)
 
                 runs = cerebro.run(stdstats=False, tradehistory=params["write_history"])
                 strategy = runs[0]
@@ -993,12 +1141,14 @@ def main(maxcpus=None):
                 analysis['PNLs'] = analyzer.get_trades_pnl()
                 analysis['Asset'] = data.sec
                 analysis['CapitalMode'] = capital_mode
+                analysis['ExitMode'] = exit_mode
                 results.append(analysis)
 
                 if params['write_history']:
                     trades_data = analyzer.get_trades()
                     for tr in trades_data:
                         tr['capital_mode'] = capital_mode
+                        tr['exit_mode'] = exit_mode
                     trades.extend(trades_data)
 
                 # Для следующего контракта используем финальную стоимость счёта.
@@ -1040,6 +1190,7 @@ def main(maxcpus=None):
         list(params.items()) + [
             ('start_cash', start_cash),
             ('capital_mode', capital_mode),
+            ('exit_mode', exit_mode),
             ('close_on_expiration', close_on_expiration),
             ('expiration_exit_bar', expiration_exit_bar),
             ('start_date', start_date),
