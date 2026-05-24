@@ -1,18 +1,21 @@
-from datetime import datetime
 from moex_store import MoexStore
 import math
 import backtrader as bt
-from cerebroview import plot
 
 
 class AutoTuneFilter(bt.Indicator):
     """
-    John Ehlers - AutoTune Filter
+    John Ehlers - AutoTune Filter.
+
     Что выдаёт индикатор:
     - bp      : tuned band-pass filter
     - filt    : high-pass filtered series
     - mincorr : минимальная rolling autocorrelation
     - dc      : dominant cycle
+
+    В конце файла есть AutoTuneDemoStrategy. Она не торгует, а только выводит
+    линии индикатора на график через CerebroView, чтобы сверить значения с
+    TradingView или другой эталонной реализацией.
     """
 
     lines = ('bp', 'filt', 'mincorr', 'dc')
@@ -166,7 +169,7 @@ class AutoTuneFilter(bt.Indicator):
 
         inner = 1.0 / (g1 * g1) - 1.0
 
-        # Ещё одна разумная float-защита:
+        # Ещё одна float-защита:
         # если inner стал чуть меньше нуля только из-за погрешности,
         # считаем его нулём.
         if inner < 0.0 and abs(inner) < 1e-12:
@@ -198,26 +201,15 @@ class AutoTuneDemoStrategy(bt.Strategy):
             bandwidth=self.p.bandwidth,
         )
 
-    # def next(self):
-        # dt = self.data.datetime.datetime(0)
-        # print(
-        #     f'{dt} | close={self.data.close[0]:.2f} | '
-        #     f'bp={self.atf.bp[0]:.6f} | '
-        #     f'filt={self.atf.filt[0]:.6f} | '
-        #     f'mincorr={self.atf.mincorr[0]:.6f} | '
-        #     f'dc={self.atf.dc[0]:.2f}'
-        # )
-
 
 if __name__ == '__main__':
     cerebro = bt.Cerebro(stdstats=False)
-    # cerebro = bt.Cerebro()
 
     store = MoexStore()
     data = store.getdata(
-        sec_id='RIM6',  #'MXM6',
+        sec_id='RIM6',
         fromdate='2026-01-15',
-        todate=datetime.today(),
+        todate='2026-05-23',
         tf='1h',
         name='RIM6'
     )
@@ -229,5 +221,6 @@ if __name__ == '__main__':
         bandwidth=0.25,
     )
     results = cerebro.run()
+
+    from cerebroview import plot
     plot(cerebro)
-    # cerebro.plot(style='candle')

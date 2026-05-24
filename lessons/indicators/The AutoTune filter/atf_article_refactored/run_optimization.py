@@ -4,37 +4,44 @@ from datetime import datetime
 from runners import run
 
 
+# STRATEGY_PARAMS = dict(
+#     write_history=False,
+#     risk=range(4, 7),
+#     window=range(65, 68),
+#     bandwidth=[i / 100 for i in range(50, 61, 10)],
+#     thresh=[-i / 100 for i in range(50, 66, 5)],
+#     allow_short=True,
+#     printlog=False,
+#     tp_mult=[i / 10 for i in range(15, 19)],
+#     min_dc=range(25, 46, 5),
+# )
+
 STRATEGY_PARAMS = dict(
     write_history=False,
-    risk=range(4, 7),
-    window=range(65, 68),
-    bandwidth=[i / 100 for i in range(50, 61, 10)],
-    thresh=[-i / 100 for i in range(50, 66, 5)],
-    allow_short=True,
+    risk=5,  #range(3, 6),
+    window=range(25, 106, 10),
+    bandwidth=[i / 100 for i in range(15, 41, 5)],
+    thresh=[-i / 100 for i in range(40, 71, 5)],
+    allow_short=False,
     printlog=False,
-    tp_mult=[i / 10 for i in range(15, 19)],
-    min_dc=range(25, 46, 5),
+    tp_mult=[i / 10 for i in range(1, 14, 3)],
+    min_dc=range(0, 41, 10)
 )
 
 RUN_SETTINGS = dict(
     start_cash=300000.0,
-    instrument_type='futures',
+    instrument_type='stocks', # 'futures' 'stocks'
     run_mode='optimize',
     capital_mode='fixed',
     exit_mode='bracket',
     close_on_expiration=True,
     expiration_exit_bar=3,
-    stock_moexcomm=0.0003,
-    stock_brokercomm=0.0003,
-    stock_price_step=0.01,
     params=STRATEGY_PARAMS,
     tf='1h',
-    start_date='2023-6-20',
+    start_date='2025-6-20',
     end_date=datetime.today(),
     main_opt_metric='PROM',
-    sec='SBRF',
-    save_equity_dd_plot=False,
-    equity_dd_plot_freq='M',
+    sec='SBER', # 'SBER' 'SBRF'
 )
 
 if __name__ == '__main__':

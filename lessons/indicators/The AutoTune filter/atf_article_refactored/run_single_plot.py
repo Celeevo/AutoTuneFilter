@@ -41,17 +41,12 @@ RUN_SETTINGS = dict(
     exit_mode='bracket',
     close_on_expiration=True,
     expiration_exit_bar=3,
-    stock_moexcomm=0.0003,
-    stock_brokercomm=0.0003,
-    stock_price_step=0.01,
     params=STRATEGY_PARAMS,
     tf='1h',
     start_date='2023-6-20',
     end_date=datetime.today(),
     main_opt_metric='PROM',
     sec='SBRF',  #  'SBRF' 'SBER'
-    save_equity_dd_plot=False,
-    equity_dd_plot_freq='M',
 )
 
 if __name__ == '__main__':

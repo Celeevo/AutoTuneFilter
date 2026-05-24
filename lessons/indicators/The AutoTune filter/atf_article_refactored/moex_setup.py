@@ -96,11 +96,13 @@ futures_comm = dict( # Комиссии для фьючерсов
     MXI=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=3500,  # - ГО 26-04-25, 3400 - ГО 07.02.2025
                           mult=0.5 / 0.05,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.05),
+                          moexcomm=FUTURE_TYPE['xindex'],
+                          cost_of_price_step=0.05),
     SPYF=FuturesCommission(commission=2.0,  # 2 руб за контракт
                           margin=4252.12 ,  # ГО 11-05-26
                           mult=0.83563 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex'], cost_of_price_step=0.01))
+                          moexcomm=FUTURE_TYPE['xindex'],
+                          cost_of_price_step=0.01))
 
 def round_to_nearest_price_step(step, value, isbuy):
     """
@@ -144,18 +146,10 @@ def normalize_instrument_type(instrument_type):
     raise ValueError("instrument_type должен быть 'futures' или 'stocks'")
 
 
-def as_list(value):
-    """Позволяет передавать sec как строку или как список тикеров."""
-    if isinstance(value, (list, tuple, set)):
-        return list(value)
 
-    return [value]
-
-
-def get_commission_info(sec, instrument_type, settings=None):
+def get_commission_info(sec, instrument_type):
     """Возвращает commission-info для фьючерса или акции."""
     instrument_type = normalize_instrument_type(instrument_type)
-    settings = settings or {}
 
     if instrument_type == 'futures':
         if sec not in futures_comm:
@@ -165,14 +159,7 @@ def get_commission_info(sec, instrument_type, settings=None):
             )
         return futures_comm[sec]
 
-    if sec in stocks_comm:
-        return stocks_comm[sec]
-
-    return StockCommission(
-        moexcomm=float(settings.get('stock_moexcomm', stocks_comm['DEFAULT'].p.moexcomm)),
-        brokercomm=float(settings.get('stock_brokercomm', stocks_comm['DEFAULT'].p.brokercomm)),
-        cost_of_price_step=float(settings.get('stock_price_step', stocks_comm['DEFAULT'].p.cost_of_price_step)),
-    )
+    return stocks_comm.get(sec, stocks_comm['DEFAULT'])
 
 
 def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
@@ -184,7 +171,7 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
         Скрипт сам находит серии через store.futures.contracts_between().
 
     stocks:
-        sec = тикер акции или список тикеров, например 'SBER' или ['SBER', 'GAZP'].
+        sec = тикер одной акции, например 'SBER'.
         Данные загружаются напрямую, без логики контрактов и экспираций.
     """
     instrument_type = normalize_instrument_type(instrument_type)
@@ -203,15 +190,12 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
             else:
                 fromdate = prevexpdate - timedelta(days=5)
 
-            contract_expdate = expdate.date()
-
             if contract == contracts[-1]:
                 todate = end_date
             else:
-                # moex_store может трактовать todate как верхнюю границу диапазона.
-                # Чтобы стратегия увидела бары дня экспирации и рыночный close(),
-                # выставленный на этом дне, успел исполниться на следующем баре,
-                # загружаем небольшой запас после expdate.
+                # Загружаем небольшой запас после даты экспирации.
+                # Закрытие позиции дальше делается в стратегии по числу баров,
+                # оставшихся до конца текущего data feed.
                 todate = expdate + timedelta(days=1)
 
             data = store.getdata(
@@ -223,27 +207,21 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
             )
 
             data.sec = sec
-            data.contract_expdate = contract_expdate
             datas.append(data)
 
         return datas, contracts
 
-    stock_tickers = as_list(sec)
-    print(stock_tickers)
+    data = store.getdata(
+        sec_id=sec,
+        fromdate=start_date,
+        todate=end_date,
+        tf=tf,
+        name=sec,
+    )
 
-    for ticker in stock_tickers:
-        data = store.getdata(
-            sec_id=ticker,
-            fromdate=start_date,
-            todate=end_date,
-            tf=tf,
-            name=ticker,
-        )
+    data.sec = sec
+    datas.append(data)
 
-        data.sec = ticker
-        data.contract_expdate = None
-        datas.append(data)
-
-    return datas, stock_tickers
+    return datas, [sec]
 
 

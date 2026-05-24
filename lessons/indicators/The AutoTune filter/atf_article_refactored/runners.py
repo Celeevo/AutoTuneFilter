@@ -13,7 +13,6 @@ from tqdm import tqdm
 from atf_strategy import AutoTuneFilterEhlersStrategy, AutoTuneFilterStrategy
 from moex_setup import get_commission_info, load_moex_datas, normalize_instrument_type
 from params_tools import count_param_variants, expand_param_combinations, iterable_params, to_single_strategy_params
-from plotting import save_best_equity_dd_plot
 from reporting import SmartAnalyzer, add_drawdown_metrics, aggregate_df
 
 _OPT_PBAR = None
@@ -67,7 +66,6 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
         to_single_strategy_params(params),
         close_on_expiration=close_on_expiration,
         expiration_exit_bar=expiration_exit_bar,
-        contract_expdate=data.contract_expdate,
     )
 
     strategy_cls = AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
@@ -76,7 +74,7 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
     cerebro.broker = bt.brokers.BackBroker()
     cerebro.broker.setcash(start_cash)
     cerebro.broker.addcommissioninfo(
-        get_commission_info(data.sec, instrument_type, settings),
+        get_commission_info(data.sec, instrument_type),
         name=data.p.name,
     )
 
@@ -154,8 +152,6 @@ def run(settings, maxcpus=None):
     end_date = settings.get('end_date') or datetime.today()
     main_opt_metric = settings.get('main_opt_metric', 'PROM')
     sec = settings.get('sec', 'SPYF')
-    save_equity_dd_plot = bool(settings.get('save_equity_dd_plot', True))
-    equity_dd_plot_freq = settings.get('equity_dd_plot_freq', 'M')
 
     total_time = _time.time()
     store = MoexStore()
@@ -197,7 +193,6 @@ def run(settings, maxcpus=None):
     results = []
     trades = []
     orders = []
-    signals = []
     analyzer_params = dict(it_params=iterable_params(params))
 
     if capital_mode not in ('fixed', 'cumulative'):
@@ -216,7 +211,7 @@ def run(settings, maxcpus=None):
             cerebro = bt.Cerebro()
             cerebro.broker = bt.brokers.BackBroker()
             cerebro.broker.setcash(start_cash)
-            cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type, settings), name=data.p.name)
+            cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type), name=data.p.name)
             cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
             cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
             cerebro.adddata(data)
@@ -225,8 +220,7 @@ def run(settings, maxcpus=None):
                 params,
                 close_on_expiration=close_on_expiration,
                 expiration_exit_bar=expiration_exit_bar,
-                contract_expdate=data.contract_expdate,
-            )
+                    )
             if exit_mode == 'bracket':
                 cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
             else:
@@ -269,11 +263,6 @@ def run(settings, maxcpus=None):
                             order_row['capital_mode'] = capital_mode
                         orders.extend(orders_data)
 
-                        signals_data = analyzer.get_signals()
-                        for signal_row in signals_data:
-                            signal_row['capital_mode'] = capital_mode
-                        signals.extend(signals_data)
-
             print(
                 f'Прогон {len(runs)} вариантов стратегии для контракта '
                 f'{data.p.name} за {round(_time.time() - st_time, 2)} сек., '
@@ -310,7 +299,7 @@ def run(settings, maxcpus=None):
                 cerebro = bt.Cerebro()
                 cerebro.broker = bt.brokers.BackBroker()
                 cerebro.broker.setcash(current_cash)
-                cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type, settings), name=data.p.name)
+                cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type), name=data.p.name)
                 cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
                 cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
                 cerebro.adddata(data)
@@ -318,8 +307,7 @@ def run(settings, maxcpus=None):
                     strategy_params,
                     close_on_expiration=close_on_expiration,
                     expiration_exit_bar=expiration_exit_bar,
-                    contract_expdate=data.contract_expdate,
-                )
+                            )
                 if exit_mode == 'bracket':
                     cerebro.addstrategy(AutoTuneFilterStrategy, **run_strategy_params)
                 else:
@@ -347,11 +335,6 @@ def run(settings, maxcpus=None):
                     for order_row in orders_data:
                         order_row['capital_mode'] = capital_mode
                     orders.extend(orders_data)
-
-                    signals_data = analyzer.get_signals()
-                    for signal_row in signals_data:
-                        signal_row['capital_mode'] = capital_mode
-                    signals.extend(signals_data)
 
                 # Для следующего контракта используем финальную стоимость счёта.
                 # При close_on_expiration=True позиция должна быть закрыта до конца контракта,
@@ -388,20 +371,13 @@ def run(settings, maxcpus=None):
     if params['write_history']:
         df2 = pd.DataFrame(trades).round(3)
         df_orders = pd.DataFrame(orders).round(3)
-        df_signals = pd.DataFrame(signals).round(6)
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
 
-    # Упрощаем итоговую вкладку results:
-    # - e-Pardo/s-Pardo оставляем внутренними расчётными метриками, но не выводим;
-    # - по DD оставляем только общепринятую максимальную просадку по broker value.
-    #   MaxClosedDD* остаётся диагностикой по закрытым сделкам и в results не выводится.
+    # В results оставляем только основные метрики. MaxDDLen скрываем, потому что
+    # для статьи достаточно MaxDDPct и MaxDDMoney.
     results_drop_cols = [
-        'e-Pardo',
-        's-Pardo',
         'MaxDDLen',
         'Asset',
-        'MaxClosedDDMoney',
-        'MaxClosedDDPct',
     ]
     df3 = df3.drop(columns=[col for col in results_drop_cols if col in df3.columns])
     df4 = pd.DataFrame(
@@ -418,7 +394,7 @@ def run(settings, maxcpus=None):
         ],
         columns=['Parameter', 'Value']
     )
-    for col in ('PNLs', 'ClosedEquity', 'MaxClosedDDMoney', 'MaxClosedDDPct', 'Asset'):
+    for col in ('PNLs', 'Asset'):
         if col in df1.columns:
             del df1[col]
 
@@ -433,42 +409,16 @@ def run(settings, maxcpus=None):
     # отдельно pip install xlsxwriter
     with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
         if not sheet_size:
-            df1.to_excel(writer, sheet_name='by Contacts', index=False)
+            if instrument_type == 'futures':
+                df1.to_excel(writer, sheet_name='by Contacts', index=False)
             if params['write_history']:
                 df2.to_excel(writer, sheet_name='trades', index=False)
                 if not df_orders.empty:
                     df_orders.to_excel(writer, sheet_name='orders', index=False)
-                if not df_signals.empty:
-                    df_signals.to_excel(writer, sheet_name='signals', index=False)
         df3.to_excel(writer, sheet_name='results', index=False)
         df4.to_excel(writer, sheet_name='params', index=False)
 
-    plot_file = None
-
-    if params['write_history'] and save_equity_dd_plot and 'df2' in locals() and not df2.empty:
-        plot_file = save_best_equity_dd_plot(
-            trades_df=df2,
-            results_df=df3,
-            results_file=results_file,
-            start_cash=start_cash,
-            freq=equity_dd_plot_freq,
-        )
-
     print(f"Результаты успешно сохранены в файл '{results_file}'.")
-
-    if plot_file:
-        print(f"Сохранён график Equity/DD: '{plot_file}'.")
-    elif save_equity_dd_plot:
-        if not params['write_history']:
-            print("График Equity/DD не сформирован: write_history=False, нет журнала сделок.")
-        elif 'df2' not in locals() or df2.empty:
-            print("График Equity/DD не сформирован: нет закрытых сделок в df2/trades.")
-        else:
-            print(
-                "График Equity/DD не сформирован: не удалось сопоставить лучший "
-                "вариант из results с записями trades. Проверьте колонки params/sec."
-            )
-
     os.startfile(results_file)
 
 
