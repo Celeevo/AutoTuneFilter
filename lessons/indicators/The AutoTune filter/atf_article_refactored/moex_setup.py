@@ -196,18 +196,23 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
 
         for contract in contracts:
             prevexpdate = pd.to_datetime(store.futures.prevexpdate(contract))
+            expdate = pd.to_datetime(store.futures.expdate(contract))
 
             if contract == contracts[0]:
                 fromdate = pd.to_datetime(start_date) - timedelta(days=5)
             else:
                 fromdate = prevexpdate - timedelta(days=5)
 
-            contract_expdate = pd.to_datetime(store.futures.expdate(contract)).date()
+            contract_expdate = expdate.date()
 
             if contract == contracts[-1]:
                 todate = end_date
             else:
-                todate = store.futures.expdate(contract)
+                # moex_store может трактовать todate как верхнюю границу диапазона.
+                # Чтобы стратегия увидела бары дня экспирации и рыночный close(),
+                # выставленный на этом дне, успел исполниться на следующем баре,
+                # загружаем небольшой запас после expdate.
+                todate = expdate + timedelta(days=1)
 
             data = store.getdata(
                 sec_id=contract,

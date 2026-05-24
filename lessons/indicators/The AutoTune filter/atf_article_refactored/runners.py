@@ -255,7 +255,6 @@ def run(settings, maxcpus=None):
                     add_drawdown_metrics(strategy, analysis)
                     analysis['Data'] = data.p.name
                     analysis['PNLs'] = analyzer.get_trades_pnl()
-                    analysis['Asset'] = data.sec
                     analysis['CapitalMode'] = capital_mode
                     results.append(analysis)
 
@@ -335,7 +334,6 @@ def run(settings, maxcpus=None):
                 add_drawdown_metrics(strategy, analysis)
                 analysis['Data'] = data.p.name
                 analysis['PNLs'] = analyzer.get_trades_pnl()
-                analysis['Asset'] = data.sec
                 analysis['CapitalMode'] = capital_mode
                 results.append(analysis)
 
@@ -401,6 +399,7 @@ def run(settings, maxcpus=None):
         'e-Pardo',
         's-Pardo',
         'MaxDDLen',
+        'Asset',
         'MaxClosedDDMoney',
         'MaxClosedDDPct',
     ]
@@ -419,7 +418,7 @@ def run(settings, maxcpus=None):
         ],
         columns=['Parameter', 'Value']
     )
-    for col in ('PNLs', 'ClosedEquity'):
+    for col in ('PNLs', 'ClosedEquity', 'MaxClosedDDMoney', 'MaxClosedDDPct', 'Asset'):
         if col in df1.columns:
             del df1[col]
 

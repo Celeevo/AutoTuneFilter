@@ -91,33 +91,6 @@ def compute_group_metrics(group, startingcash=1):
     max_dd_money = group['MaxDDMoney'].max() if 'MaxDDMoney' in group.columns else 0
     max_dd_len = group['MaxDDLen'].max() if 'MaxDDLen' in group.columns else 0
 
-    max_closed_dd_pct = group['MaxClosedDDPct'].max() if 'MaxClosedDDPct' in group.columns else 0
-    max_closed_dd_money = group['MaxClosedDDMoney'].max() if 'MaxClosedDDMoney' in group.columns else 0
-
-    # В cumulative-режиме логичнее считать закрытую просадку по всей
-    # последовательности контрактов одного набора параметров. Для этого
-    # склеиваем ClosedEquity из строк группы в один ряд.
-    if 'ClosedEquity' in group.columns:
-        modes = set(str(x).lower() for x in group.get('CapitalMode', pd.Series(dtype=str)).dropna())
-        if 'cumulative' in modes:
-            closed_equity = []
-            for series in group['ClosedEquity']:
-                if not isinstance(series, (list, tuple)) or not series:
-                    continue
-                series = [float(x) for x in series]
-                if not closed_equity:
-                    closed_equity.extend(series)
-                else:
-                    # Если первый элемент нового фрагмента совпадает с последним
-                    # элементом предыдущего, не дублируем его.
-                    if abs(closed_equity[-1] - series[0]) < 0.01:
-                        closed_equity.extend(series[1:])
-                    else:
-                        closed_equity.extend(series)
-
-            if closed_equity:
-                max_closed_dd_pct, max_closed_dd_money, _ = calc_max_drawdown_from_values(closed_equity)
-
     # Получаем последние значения PNL
     last_pnl = group['PNL'].iloc[-1]
     pre_last_pnl = group['PNL'].iloc[-2] if len(group) >= 2 else 0
@@ -145,12 +118,8 @@ def compute_group_metrics(group, startingcash=1):
     last4 = group['PNL'].iloc[-4:]
     last4neg = (last4 < 0).sum()
 
-    # Берем значение Asset из первой строки группы
-    asset = group['Asset'].iloc[0]
-
     # Формируем результирующую серию
     result = pd.Series({
-        'Asset': asset,  # Добавляем колонку Asset
         'PNL': pnl,
         'WinTr': lenw,
         'LossTr': lenl,
@@ -166,8 +135,6 @@ def compute_group_metrics(group, startingcash=1):
         'MaxDDPct': max_dd_pct,
         'MaxDDMoney': max_dd_money,
         'MaxDDLen': max_dd_len,
-        'MaxClosedDDMoney': max_closed_dd_money,
-        'MaxClosedDDPct': max_closed_dd_pct,
         'PF': pf,
         'PROM': prom,
         'e-Pardo': e_pardo,
@@ -180,11 +147,9 @@ def compute_group_metrics(group, startingcash=1):
 
 def aggregate_df(df, startingcash=1, sort_by='s-Pardo', sort_by_second='s-Pardo'):
     first_col = df.columns[0]
-    metric_cols = ['PNLs', 'PNL', 'Asset']
+    metric_cols = ['PNLs', 'PNL']
     for col in (
         'MaxDDPct', 'MaxDDMoney', 'MaxDDLen',
-        'MaxClosedDDMoney', 'MaxClosedDDPct',
-        'ClosedEquity', 'CapitalMode',
     ):
         if col in df.columns:
             metric_cols.append(col)
@@ -437,15 +402,10 @@ class SmartAnalyzer(Analyzer):
         end_value = float(self.strategy.broker.getvalue())
 
         self.rets[params_head] = params_str
-        max_closed_dd_pct, max_closed_dd_money, _ = calc_max_drawdown_from_values(self.closed_equity)
-
         self.rets['StartCash'] = start_cash
         self.rets['EndCash'] = end_cash
         self.rets['EndValue'] = end_value
         self.rets['ContractPNL'] = end_value - start_cash
-        self.rets['MaxClosedDDMoney'] = max_closed_dd_money
-        self.rets['MaxClosedDDPct'] = max_closed_dd_pct
-        self.rets['ClosedEquity'] = list(self.closed_equity)
         self.rets['PNL'] = pnl
         self.rets['WinTr'] = wt
         self.rets['LossTr'] = lt

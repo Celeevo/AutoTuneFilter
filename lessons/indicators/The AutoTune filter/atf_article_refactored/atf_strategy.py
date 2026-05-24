@@ -236,6 +236,39 @@ class AutoTuneFilterStrategy(bt.Strategy):
             and self._session_bar_no >= int(self.p.expiration_exit_bar)
         )
 
+    def _data_bars_left(self):
+        """
+        Возвращает количество баров, оставшихся в текущем источнике данных
+        после текущего бара.
+
+        В историческом прогоне при preload=True Backtrader знает полную длину
+        data feed через buflen(). Это надёжнее, чем привязываться к календарной
+        дате экспирации: по отдельным контрактам последний доступный бар может
+        быть раньше/позже формальной даты.
+        """
+        try:
+            return int(self.data.buflen()) - int(len(self.data))
+        except Exception:
+            return None
+
+    def _is_data_end_exit_window(self):
+        """True, если пора блокировать новые входы и закрывать позицию перед концом data feed."""
+        if not self.p.close_on_expiration:
+            return False
+
+        bars_left = self._data_bars_left()
+
+        if bars_left is None:
+            return self._is_after_expiration_exit_bar()
+
+        return bars_left <= int(self.p.expiration_exit_bar)
+
+    def _cancel_entry_order(self):
+        """Отменяет ещё не исполненный входной ордер, если он есть."""
+        if self.order is not None and self.order.alive():
+            self.cancel(self.order)
+        self.order = None
+
     def _cancel_bracket_children(self):
         """Отменяет защитные bracket-ордера перед принудительным закрытием."""
         for order in (self.stop_order, self.take_profit_order):
@@ -246,7 +279,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.take_profit_order = None
 
     def _submit_expiration_close(self):
-        """Закрывает открытую позицию на заданном баре дня экспирации."""
+        """Закрывает открытую позицию перед завершением текущего data feed."""
         if not self.position:
             return
 
@@ -254,9 +287,10 @@ class AutoTuneFilterStrategy(bt.Strategy):
             return
 
         self._cancel_bracket_children()
+        bars_left = self._data_bars_left()
         self.log(
-            f'EXPIRATION EXIT -> close() on bar '
-            f'{self._session_bar_no} of {self.data.datetime.date(0)}'
+            f'DATA END EXIT -> close() | '
+            f'date={self.data.datetime.date(0)} | bars_left={bars_left}'
         )
         self.expiration_close_order = self.close(name='expiration_close')
 
@@ -380,19 +414,24 @@ class AutoTuneFilterStrategy(bt.Strategy):
         long_now = bool(self.long_signal[0])
         short_now = bool(self.short_signal[0])
 
-        # В день экспирации не открываем новые сделки. Если позиция была
-        # перенесена в этот день, на заданном баре отправляем рыночный close().
-        # В обычном режиме Backtrader такой close() исполнится на следующем баре.
-        if self.p.close_on_expiration and self._is_expiration_day():
+        # Перед завершением текущего data feed не открываем новые сделки.
+        # Если позиция ещё открыта, заранее отправляем рыночный close().
+        # В обычном режиме Backtrader close() исполнится на следующем баре,
+        # поэтому сигнал на закрытие нужно отправлять ДО последнего бара.
+        if self._is_data_end_exit_window():
             if long_now or short_now:
                 self._record_signal(
-                    decision='blocked_by_expiration',
+                    decision='blocked_by_data_end',
                     long_signal=long_now,
                     short_signal=short_now,
                 )
 
-            if self._is_after_expiration_exit_bar():
+            if self.position:
                 self._submit_expiration_close()
+            else:
+                self._cancel_entry_order()
+                self._cancel_bracket_children()
+
             return
 
         if self.position or self._has_active_orders():
