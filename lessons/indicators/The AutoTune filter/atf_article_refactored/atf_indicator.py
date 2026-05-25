@@ -1,4 +1,3 @@
-from moex_store import MoexStore
 import math
 import backtrader as bt
 
@@ -203,6 +202,8 @@ class AutoTuneDemoStrategy(bt.Strategy):
 
 
 if __name__ == '__main__':
+    from moex_store import MoexStore
+
     cerebro = bt.Cerebro(stdstats=False)
 
     store = MoexStore()

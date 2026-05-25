@@ -4,6 +4,67 @@ from atf_indicator import AutoTuneFilter
 from moex_setup import round_to_nearest_price_step
 
 
+# Внутреннее защитное правило: стратегия закрывает позицию за 3 бара
+# до конца текущего data feed. Для фьючерса это конец контракта,
+# для акции — конец выбранной истории. Это не параметр оптимизации.
+DATA_END_EXIT_BARS = 3
+
+
+class EquityDrawDownIndicator(bt.Indicator):
+    """
+    Equity PnL и Drawdown для вывода в CerebroView.
+
+    Это не торговый индикатор и не участвует в сигналах стратегии.
+    Он создаётся только в режиме run_single_plot.py и обновляется один раз
+    на каждом баре основного источника данных. Поэтому значения Equity/DD
+    идут в том же таймфрейме, что и основной график стратегии.
+
+    Линии настроены как bar/histogram: equity_pnl показывает изменение
+    стоимости счёта относительно стартового капитала, drawdown показывает
+    текущую просадку от максимума стоимости счёта.
+    """
+
+    lines = ('equity_pnl', 'drawdown')
+
+    params = (
+        ('start_value', None),
+    )
+
+    plotinfo = dict(
+        subplot=True,
+        plotname='Equity / DD',
+    )
+
+    # _method='bar' — стандартная для Backtrader подсказка отрисовщику:
+    # показывать линию не обычной кривой, а столбцами. CerebroView должен
+    # читать эти plotline-настройки при auto-discovery индикаторов.
+    plotlines = dict(
+        equity_pnl=dict(_name='Equity PnL', _method='bar'),
+        drawdown=dict(_name='Drawdown', _method='bar'),
+    )
+
+    def __init__(self):
+        self._start_value = None
+        self._max_value = None
+
+    def next(self):
+        value = float(self._owner.broker.getvalue())
+
+        if self._start_value is None:
+            if self.p.start_value is None:
+                self._start_value = value
+            else:
+                self._start_value = float(self.p.start_value)
+
+        if self._max_value is None:
+            self._max_value = value
+        else:
+            self._max_value = max(self._max_value, value)
+
+        self.lines.equity_pnl[0] = value - self._start_value
+        self.lines.drawdown[0] = value - self._max_value
+
+
 class AutoTuneFilterStrategy(bt.Strategy):
     """
     Strategy based on Financial Hacker article:
@@ -24,9 +85,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
         allow_short=True,
         printlog=False,
         tp_mult=2.0,   # тейк-профит в R
-        close_on_expiration=True,  # закрывать позицию перед окончанием текущего data feed/контракта
-        expiration_exit_bar=3,     # за сколько баров до конца data feed отправлять close()
         min_dc=0,      # минимальный dominant cycle AutoTune для входа, в барах
+        show_equity_dd=False,  # в single_plot выводить Equity PnL / Drawdown как индикатор CerebroView
     )
 
     def log(self, txt):
@@ -40,6 +100,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth,
         )
+
+        if self.p.show_equity_dd:
+            self.equity_dd = EquityDrawDownIndicator(
+                self.data,
+                start_value=self.broker.getvalue(),
+            )
 
         self.stop_loss_price = 0.0
         self.entry_price = 0.0
@@ -65,13 +131,13 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
-        self.expiration_close_order = None
+        self.data_end_close_order = None
 
     def _reset_bracket_state(self):
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
-        self.expiration_close_order = None
+        self.data_end_close_order = None
         self.stop_loss_price = 0.0
         self.take_profit_price = 0.0
         self.entry_price = 0.0
@@ -79,7 +145,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
     def _has_active_orders(self):
         return any(
             order is not None and order.alive()
-            for order in (self.order, self.stop_order, self.take_profit_order, self.expiration_close_order)
+            for order in (self.order, self.stop_order, self.take_profit_order, self.data_end_close_order)
         )
 
     def _round_exit_price(self, comminfo, price, isbuy):
@@ -139,11 +205,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
 
     def _is_data_end_exit_window(self):
         """True, если пора блокировать новые входы и закрывать позицию перед концом data feed."""
-        if not self.p.close_on_expiration:
-            return False
-
         bars_left = self._data_bars_left()
-        return bars_left is not None and bars_left <= int(self.p.expiration_exit_bar)
+        return bars_left is not None and bars_left <= DATA_END_EXIT_BARS
 
     def _cancel_entry_order(self):
         """Отменяет ещё не исполненный входной ордер, если он есть."""
@@ -160,12 +223,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.stop_order = None
         self.take_profit_order = None
 
-    def _submit_expiration_close(self):
+    def _submit_data_end_close(self):
         """Закрывает открытую позицию перед завершением текущего data feed."""
         if not self.position:
             return
 
-        if self.expiration_close_order is not None and self.expiration_close_order.alive():
+        if self.data_end_close_order is not None and self.data_end_close_order.alive():
             return
 
         self._cancel_bracket_children()
@@ -174,7 +237,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
             f'DATA END EXIT -> close() | '
             f'date={self.data.datetime.date(0)} | bars_left={bars_left}'
         )
-        self.expiration_close_order = self.close(name='expiration_close')
+        self.data_end_close_order = self.close(name='data_end_close')
 
     def _calc_bracket_params(self, isbuy):
         comminfo = self.broker.getcommissioninfo(self.data)
@@ -272,7 +335,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
             elif order_name == 'take_profit':
                 self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
                 self._reset_bracket_state()
-            elif order_name == 'expiration_close':
+            elif order_name == 'data_end_close':
                 self.log(f'DATA END CLOSE EXECUTED at {order.executed.price:.2f}')
                 self._reset_bracket_state()
 
@@ -285,8 +348,8 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 self.stop_order = None
             elif order_name == 'take_profit':
                 self.take_profit_order = None
-            elif order_name == 'expiration_close':
-                self.expiration_close_order = None
+            elif order_name == 'data_end_close':
+                self.data_end_close_order = None
 
     def next(self):
         # Перед завершением текущего data feed не открываем новые сделки.
@@ -295,7 +358,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
         # поэтому сигнал на закрытие нужно отправлять ДО последнего бара.
         if self._is_data_end_exit_window():
             if self.position:
-                self._submit_expiration_close()
+                self._submit_data_end_close()
             else:
                 self._cancel_entry_order()
                 self._cancel_bracket_children()
@@ -408,7 +471,7 @@ class AutoTuneFilterEhlersStrategy(AutoTuneFilterStrategy):
     def next(self):
         if self._is_data_end_exit_window():
             if self.position:
-                self._submit_expiration_close()
+                self._submit_data_end_close()
             else:
                 self._cancel_entry_order()
             return

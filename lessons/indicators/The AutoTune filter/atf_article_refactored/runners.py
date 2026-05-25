@@ -10,7 +10,7 @@ import pandas as pd
 from moex_store import MoexStore
 from tqdm import tqdm
 
-from atf_strategy import AutoTuneFilterEhlersStrategy, AutoTuneFilterStrategy
+from atf_strategy import DATA_END_EXIT_BARS, AutoTuneFilterEhlersStrategy, AutoTuneFilterStrategy
 from moex_setup import get_commission_info, load_moex_datas, normalize_instrument_type
 from params_tools import count_param_variants, expand_param_combinations, iterable_params, to_single_strategy_params
 from reporting import SmartAnalyzer, add_drawdown_metrics, aggregate_df
@@ -36,41 +36,132 @@ def _set_script_version():
 
 SCRIPT_VERSION = _script_version()
 
-def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_mode,
-                    close_on_expiration, expiration_exit_bar):
-    """
-    Запускает один прогон через cerebro.addstrategy() и показывает результат через CerebroView.
 
-    Это режим не для оптимизации, а для визуального разбора сделок:
-    - один инструмент / один data feed;
-    - один конкретный набор параметров;
-    - после cerebro.run() вызывается plot(cerebro).
+def _data_name(data):
+    return str(getattr(data.p, 'name', ''))
+
+
+def _available_data_names(datas):
+    return [_data_name(data) for data in datas]
+
+
+def _select_single_plot_data(settings, datas, instrument_type, sec):
+    """
+    Выбирает один data feed для run_single_plot.py.
+
+    ВАЖНО: для фьючерсов режим single_plot строит график только по одному
+    конкретному контракту. Это не склейка всей серии контрактов и не
+    cumulative-прогон по нескольким контрактам.
     """
     if not datas:
-        raise ValueError("Нет загруженных данных для single_plot")
+        raise ValueError('Нет загруженных данных для single_plot')
 
-    plot_data_name = settings.get('plot_data_name')
-    plot_data_index = int(settings.get('plot_data_index', 0))
+    contract = settings.get('contract')
+    names = _available_data_names(datas)
 
-    if plot_data_name:
-        selected = [data for data in datas if str(data.p.name) == str(plot_data_name)]
-        if not selected:
-            raise ValueError(f"plot_data_name='{plot_data_name}' не найден среди загруженных datas")
-        data = selected[0]
-    else:
-        if plot_data_index < 0 or plot_data_index >= len(datas):
-            raise IndexError(f"plot_data_index={plot_data_index} вне диапазона datas: 0..{len(datas) - 1}")
-        data = datas[plot_data_index]
+    if instrument_type == 'futures':
+        if contract:
+            selected = [data for data in datas if _data_name(data) == str(contract)]
+            if not selected:
+                raise ValueError(
+                    f"contract='{contract}' не найден среди загруженных контрактов {sec}. "
+                    f"Доступные контракты: {', '.join(names)}"
+                )
+            data = selected[0]
+        else:
+            if len(datas) > 1:
+                raise ValueError(
+                    f"Для run_single_plot.py по фьючерсу {sec} нужно явно задать "
+                    f"RUN_SETTINGS['contract']. Между указанными датами найдено "
+                    f"несколько контрактов: {', '.join(names)}.\n"
+                    f"single_plot строит один график CerebroView по одному контракту, "
+                    f"а не склейку всей фьючерсной серии."
+                )
+            data = datas[0]
+
+        print(
+            f"[single_plot] Фьючерс {sec}: для графика выбран контракт {_data_name(data)}. "
+            f"Это один контракт, не склейка последовательных контрактов."
+        )
+        return data
+
+    if contract:
+        print(f"[single_plot] Параметр contract='{contract}' игнорируется для акций.")
+
+    if len(datas) != 1:
+        raise ValueError(
+            f"Для акции {sec} ожидался один data feed, но загружено {len(datas)}: "
+            f"{', '.join(names)}"
+        )
+
+    return datas[0]
+
+
+def _write_single_result_excel(sec, tf, settings, data, instrument_type, strategy_params,
+                               analysis, analyzer, start_cash, exit_mode):
+    """Сохраняет результат одиночного прогона run_single_plot.py в Excel."""
+    timestamp = datetime.now().strftime('%d-%m-%y %H-%M')
+    results_file = f'single_run_{sec}_{tf}_{timestamp}.xlsx'
+
+    result_row = dict(analysis)
+    result_row['Data'] = _data_name(data)
+    result_row['InstrumentType'] = instrument_type
+    result_row['ExitMode'] = exit_mode
+
+    result_df = pd.DataFrame([result_row]).round(2)
+    for col in ('PNLs', 'Asset'):
+        if col in result_df.columns:
+            del result_df[col]
+
+    trades_df = pd.DataFrame(analyzer.get_trades()).round(3)
+    orders_df = pd.DataFrame(analyzer.get_orders()).round(3)
+
+    params_rows = [
+        ('start_cash', start_cash),
+        ('instrument_type', instrument_type),
+        ('sec', sec),
+        ('data', _data_name(data)),
+        ('tf', tf),
+        ('start_date', settings.get('start_date')),
+        ('end_date', settings.get('end_date')),
+        ('exit_mode', exit_mode),
+        ('data_end_exit_rule', f'close position {DATA_END_EXIT_BARS} bars before data end'),
+    ]
+    params_rows.extend(strategy_params.items())
+    params_df = pd.DataFrame(params_rows, columns=['Parameter', 'Value'])
+
+    with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
+        result_df.to_excel(writer, sheet_name='result', index=False)
+        trades_df.to_excel(writer, sheet_name='trades', index=False)
+        orders_df.to_excel(writer, sheet_name='orders', index=False)
+        params_df.to_excel(writer, sheet_name='params', index=False)
+
+    print(f"[single_plot] Результаты одиночного прогона сохранены в файл '{results_file}'.")
+
+    try:
+        os.startfile(results_file)
+    except AttributeError:
+        pass
+
+    return results_file
+
+
+def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_mode, sec, tf):
+    """
+    Запускает один прогон через cerebro.addstrategy(), сохраняет Excel
+    с результатом и показывает график через CerebroView.
+    """
+    data = _select_single_plot_data(settings, datas, instrument_type, sec)
 
     strategy_params = dict(
         to_single_strategy_params(params),
-        close_on_expiration=close_on_expiration,
-        expiration_exit_bar=expiration_exit_bar,
+        write_history=True,       # single-прогон всегда сохраняет сделки/ордера в Excel
+        show_equity_dd=True,
     )
 
     strategy_cls = AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
 
-    cerebro = bt.Cerebro(stdstats=False)
+    cerebro = bt.Cerebro(stdstats=True, runonce=False)
     cerebro.broker = bt.brokers.BackBroker()
     cerebro.broker.setcash(start_cash)
     cerebro.broker.addcommissioninfo(
@@ -81,8 +172,6 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
     cerebro.adddata(data)
     cerebro.addstrategy(strategy_cls, **strategy_params)
 
-    # Анализаторы оставляем, чтобы при необходимости можно было быстро
-    # посмотреть результат прогона в консоли.
     analyzer_params = dict(
         it_params=iterable_params(strategy_params),
         asset=data.sec,
@@ -91,19 +180,21 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
 
     print(
-        f"[single_plot] Запуск {data.p.name} | instrument_type={instrument_type} | "
+        f"[single_plot] Запуск {_data_name(data)} | instrument_type={instrument_type} | "
         f"exit_mode={exit_mode} | start_cash={start_cash:.2f}"
     )
     print(f"[single_plot] params={strategy_params}")
 
     results = cerebro.run(
-        stdstats=False,
-        tradehistory=bool(strategy_params.get("write_history", True)),
+        stdstats=True,
+        runonce=False,
+        tradehistory=True,
         maxcpus=1,
     )
 
     strategy = results[0]
-    analysis = dict(strategy.analyzers.full.get_analysis())
+    analyzer = strategy.analyzers.full
+    analysis = dict(analyzer.get_analysis())
     add_drawdown_metrics(strategy, analysis)
 
     print(
@@ -112,6 +203,19 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
         f"WinTr={analysis.get('WinTr', 0)} | LossTr={analysis.get('LossTr', 0)} | "
         f"MaxDDPct={analysis.get('MaxDDPct', 0):.2f} | "
         f"MaxDDMoney={analysis.get('MaxDDMoney', 0):.2f}"
+    )
+
+    _write_single_result_excel(
+        sec=sec,
+        tf=tf,
+        settings=settings,
+        data=data,
+        instrument_type=instrument_type,
+        strategy_params=strategy_params,
+        analysis=analysis,
+        analyzer=analyzer,
+        start_cash=start_cash,
+        exit_mode=exit_mode,
     )
 
     try:
@@ -123,13 +227,53 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
             "from cerebroview import plot"
         ) from exc
 
-    plot_kwargs = settings.get('cerebroview_plot_kwargs') or {}
-    cerebroview_plot(cerebro, **plot_kwargs)
+    cerebroview_plot(cerebro)
 
     return results
 
 
-def run(settings, maxcpus=None):
+def run_single_plot_from_settings(settings):
+    """Публичный вход для run_single_plot.py."""
+    _set_script_version()
+
+    if settings is None:
+        raise ValueError('settings must be provided')
+
+    start_cash = float(settings.get('start_cash', 300000.0))
+    instrument_type = normalize_instrument_type(settings.get('instrument_type', 'futures'))
+    exit_mode = str(settings.get('exit_mode', 'bracket')).lower()
+    params = dict(settings['params'])
+    tf = settings.get('tf', '1h')
+    start_date = settings.get('start_date', '2023-6-20')
+    end_date = settings.get('end_date') or datetime.today()
+    sec = settings.get('sec', 'SPYF')
+
+    if exit_mode not in ('bracket', 'ehlers'):
+        raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
+
+    store = MoexStore()
+    datas, _ = load_moex_datas(
+        store=store,
+        sec=sec,
+        instrument_type=instrument_type,
+        start_date=start_date,
+        end_date=end_date,
+        tf=tf,
+    )
+
+    return run_single_plot(
+        settings=settings,
+        datas=datas,
+        instrument_type=instrument_type,
+        params=params,
+        start_cash=start_cash,
+        exit_mode=exit_mode,
+        sec=sec,
+        tf=tf,
+    )
+
+
+def run_optimization_from_settings(settings, maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
     global _OPT_PBAR
     _set_script_version()
@@ -139,11 +283,8 @@ def run(settings, maxcpus=None):
 
     start_cash = float(settings.get('start_cash', 300000.0))
     instrument_type = normalize_instrument_type(settings.get('instrument_type', 'futures'))
-    run_mode = str(settings.get('run_mode', 'optimize')).lower().strip()
     capital_mode = settings.get('capital_mode', 'fixed')
     exit_mode = settings.get('exit_mode', 'bracket')
-    close_on_expiration = bool(settings.get('close_on_expiration', True))
-    expiration_exit_bar = int(settings.get('expiration_exit_bar', 3))
 
     params = dict(settings['params'])
 
@@ -177,23 +318,15 @@ def run(settings, maxcpus=None):
           f'{variants * len(datas)} вариантов.')
     print(f'Время пошло, {datetime.now():%H:%M:%S}')
 
-    if run_mode in ('single_plot', 'single', 'plot'):
-        run_single_plot(
-            settings=settings,
-            datas=datas,
-            instrument_type=instrument_type,
-            params=params,
-            start_cash=start_cash,
-            exit_mode=exit_mode,
-            close_on_expiration=close_on_expiration,
-            expiration_exit_bar=expiration_exit_bar,
-        )
-        return
-
     results = []
     trades = []
     orders = []
     analyzer_params = dict(it_params=iterable_params(params))
+
+    if instrument_type == 'stocks':
+        if capital_mode != 'fixed':
+            print('[optimization] Для акций capital_mode игнорируется; используется fixed.')
+        capital_mode = 'fixed'
 
     if capital_mode not in ('fixed', 'cumulative'):
         raise ValueError("capital_mode должен быть 'fixed' или 'cumulative'")
@@ -216,11 +349,7 @@ def run(settings, maxcpus=None):
             cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
             cerebro.adddata(data)
 
-            strategy_params = dict(
-                params,
-                close_on_expiration=close_on_expiration,
-                expiration_exit_bar=expiration_exit_bar,
-                    )
+            strategy_params = dict(params)
             if exit_mode == 'bracket':
                 cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
             else:
@@ -235,7 +364,7 @@ def run(settings, maxcpus=None):
                 )
                 cerebro.optcallback(opt_progress_cb)
 
-            runs = cerebro.run(stdstats=False, tradehistory=params["write_history"], maxcpus=maxcpus)
+            runs = cerebro.run(stdstats=False, tradehistory=params.get('write_history', False), maxcpus=maxcpus)
 
             if _OPT_PBAR is not None:
                 _OPT_PBAR.close()
@@ -252,7 +381,7 @@ def run(settings, maxcpus=None):
                     analysis['CapitalMode'] = capital_mode
                     results.append(analysis)
 
-                    if params['write_history']:
+                    if params.get('write_history', False):
                         trades_data = analyzer.get_trades()
                         for tr in trades_data:
                             tr['capital_mode'] = capital_mode
@@ -303,17 +432,13 @@ def run(settings, maxcpus=None):
                 cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
                 cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
                 cerebro.adddata(data)
-                run_strategy_params = dict(
-                    strategy_params,
-                    close_on_expiration=close_on_expiration,
-                    expiration_exit_bar=expiration_exit_bar,
-                            )
+                run_strategy_params = dict(strategy_params)
                 if exit_mode == 'bracket':
                     cerebro.addstrategy(AutoTuneFilterStrategy, **run_strategy_params)
                 else:
                     cerebro.addstrategy(AutoTuneFilterEhlersStrategy, **run_strategy_params)
 
-                runs = cerebro.run(stdstats=False, tradehistory=params["write_history"])
+                runs = cerebro.run(stdstats=False, tradehistory=params.get('write_history', False))
                 strategy = runs[0]
                 analyzer = strategy.analyzers.full
 
@@ -325,7 +450,7 @@ def run(settings, maxcpus=None):
                 analysis['CapitalMode'] = capital_mode
                 results.append(analysis)
 
-                if params['write_history']:
+                if params.get('write_history', False):
                     trades_data = analyzer.get_trades()
                     for tr in trades_data:
                         tr['capital_mode'] = capital_mode
@@ -337,7 +462,7 @@ def run(settings, maxcpus=None):
                     orders.extend(orders_data)
 
                 # Для следующего контракта используем финальную стоимость счёта.
-                # При close_on_expiration=True позиция должна быть закрыта до конца контракта,
+                # Позиция закрывается за DATA_END_EXIT_BARS баров до конца data feed,
                 # поэтому EndValue не должен включать незакрытый mark-to-market хвост.
                 current_cash = analysis.get('EndValue', cerebro.broker.getvalue())
 
@@ -368,7 +493,7 @@ def run(settings, maxcpus=None):
           f'{round((_time.time() - total_time) / 3600, 2)} часов.')
 
     df1 = pd.DataFrame(results).round(2)
-    if params['write_history']:
+    if params.get('write_history', False):
         df2 = pd.DataFrame(trades).round(3)
         df_orders = pd.DataFrame(orders).round(3)
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
@@ -384,11 +509,9 @@ def run(settings, maxcpus=None):
         list(params.items()) + [
             ('start_cash', start_cash),
             ('instrument_type', instrument_type),
-            ('run_mode', run_mode),
             ('capital_mode', capital_mode),
             ('exit_mode', exit_mode),
-            ('close_on_expiration', close_on_expiration),
-            ('expiration_exit_bar', expiration_exit_bar),
+            ('data_end_exit_rule', f'close position {DATA_END_EXIT_BARS} bars before data end'),
             ('start_date', start_date),
             ('end_date', end_date),
         ],
@@ -410,8 +533,8 @@ def run(settings, maxcpus=None):
     with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
         if not sheet_size:
             if instrument_type == 'futures':
-                df1.to_excel(writer, sheet_name='by Contacts', index=False)
-            if params['write_history']:
+                df1.to_excel(writer, sheet_name='by Contracts', index=False)
+            if params.get('write_history', False):
                 df2.to_excel(writer, sheet_name='trades', index=False)
                 if not df_orders.empty:
                     df_orders.to_excel(writer, sheet_name='orders', index=False)
@@ -422,4 +545,7 @@ def run(settings, maxcpus=None):
     os.startfile(results_file)
 
 
+def run(settings, maxcpus=None):
+    """Backward-compatible alias. New code should call run_optimization_from_settings()."""
+    return run_optimization_from_settings(settings, maxcpus=maxcpus)
 

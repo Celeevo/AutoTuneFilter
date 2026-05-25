@@ -1,56 +1,41 @@
-import os
 from datetime import datetime
 
-from runners import run
+from runners import run_single_plot_from_settings
+
 
 STRATEGY_PARAMS = dict(
-    write_history=False,
+    # В single-прогоне write_history принудительно включается внутри runners.py,
+    # чтобы Excel-файл всегда содержал результат, сделки и ордера.
     risk=5,
-    window=67,
-    bandwidth=0.5,
-    thresh=-0.55,
-    allow_short=True,
+    window=75,
+    bandwidth=0.2,
+    thresh=-0.65,
+    allow_short=False,
     printlog=False,
-    tp_mult=1.5,
-    min_dc=35,
+    tp_mult=0.45,
+    min_dc=0,
 )
-
-# STRATEGY_PARAMS = dict(
-#     write_history=False,
-#     risk=5,
-#     window=range(50, 96, 5),
-#     bandwidth=[i / 100 for i in range(10, 71, 10)],
-#     thresh=[-i / 100 for i in range(10, 71, 10)],
-#     allow_short=False,
-#     printlog=False,
-#     tp_mult=[i / 10 for i in range(1, 21, 5)],
-#     min_dc=0,
-# )
 
 RUN_SETTINGS = dict(
     start_cash=300000.0,
-    instrument_type='futures', # 'stocks' 'futures'
-    run_mode='optimize', # 'optimize' 'single_plot'
-    plot_data_index=0,
-    plot_data_name=None,
-    cerebroview_plot_kwargs={},
-    # fixed      — каждый контракт/инструмент запускается с одинакового start_cash.
-    # cumulative — капитал переносится от контракта к контракту отдельно
-    #              для каждой комбинации параметров.
-    capital_mode='cumulative',
-    exit_mode='bracket',
-    close_on_expiration=True,
-    expiration_exit_bar=3,
+    instrument_type='stocks',   # 'stocks' / 'futures'
+    exit_mode='bracket',        # 'bracket' / 'ehlers'
+    # Позиция закрывается автоматически за 3 бара до конца data feed.
+    # Для фьючерсов это конец выбранного контракта, для акций — конец истории.
     params=STRATEGY_PARAMS,
     tf='1h',
-    start_date='2023-6-20',
+    start_date='2025-6-20',
     end_date=datetime.today(),
-    main_opt_metric='PROM',
-    sec='SBRF',  #  'SBRF' 'SBER'
+    sec='SBER',  # 'SBER' / 'SBRF'
+
+    # ВАЖНО для futures:
+    # run_single_plot.py строит график только по одному конкретному контракту.
+    # Это не склейка всей фьючерсной серии и не cumulative-прогон по нескольким
+    # последовательным контрактам. Если между датами найдено несколько контрактов,
+    # contract нужно задать явно, иначе запуск остановится с понятной ошибкой.
+    # Пример: contract='SRM6'  # укажите фактическое имя контракта из списка загрузки
+    contract=None,
 )
 
 if __name__ == '__main__':
-    maxcpus = os.cpu_count()
-    available_cpus = max(1, maxcpus - 2)
-    print(f'Задействуем {available_cpus} потоков из {maxcpus} возможных.')
-    run(RUN_SETTINGS, maxcpus=available_cpus)
+    run_single_plot_from_settings(RUN_SETTINGS)
