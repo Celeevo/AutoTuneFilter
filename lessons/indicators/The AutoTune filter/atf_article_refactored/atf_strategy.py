@@ -67,7 +67,7 @@ class EquityDrawDownIndicator(bt.Indicator):
 
 class AutoTuneFilterStrategy(bt.Strategy):
     """
-    Strategy based on Financial Hacker article:
+    Оригинальная стратегия Элерса:
     - ROC = BP - BP[2]
     - Long  when ROC crosses above 0 and MinCorr < Thresh
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
@@ -107,10 +107,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
                 start_value=self.broker.getvalue(),
             )
 
-        self.stop_loss_price = 0.0
-        self.entry_price = 0.0
-        self.take_profit_price = 0.0
-
         self.roc = self.atf.bp - self.atf.bp(-2)
         self.cross_up = bt.indicators.CrossUp(self.roc, 0.0)
         self.cross_down = bt.indicators.CrossDown(self.roc, 0.0)
@@ -128,6 +124,9 @@ class AutoTuneFilterStrategy(bt.Strategy):
             self.atf.dc >= self.p.min_dc,
         )
 
+        self.stop_loss_price = 0.0
+        self.entry_price = 0.0
+        self.take_profit_price = 0.0
         self.order = None
         self.stop_order = None
         self.take_profit_order = None
@@ -282,7 +281,7 @@ class AutoTuneFilterStrategy(bt.Strategy):
     def _submit_bracket(self, isbuy):
         bracket_params = self._calc_bracket_params(isbuy)
         if bracket_params is None:
-            return False
+            return
 
         size, stop_price, limit_price = bracket_params
         side = 'long' if isbuy else 'short'
@@ -314,7 +313,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
             f'TP({self.p.tp_mult}R)={self.take_profit_price:.2f}'
         )
 
-        return True
 
     def notify_order(self, order):
         if order.status in [order.Submitted, order.Accepted]:
@@ -385,11 +383,6 @@ class AutoTuneFilterEhlersStrategy(AutoTuneFilterStrategy):
     def _calc_ehlers_target_size(self):
         """
         Рассчитывает целевой размер позиции для always-in-the-market логики.
-
-        Здесь нет SL/TP bracket-ордера. При обратном сигнале стратегия должна
-        перейти к противоположной позиции. Размер считаем от текущей стоимости
-        счёта, а не только от свободного cash, потому что при развороте часть
-        средств уже занята маржой открытой позиции.
         """
         comminfo = self.broker.getcommissioninfo(self.data)
         account_value = self.broker.getvalue()

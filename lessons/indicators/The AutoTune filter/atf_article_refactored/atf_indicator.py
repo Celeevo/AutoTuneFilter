@@ -6,7 +6,7 @@ class AutoTuneFilter(bt.Indicator):
     """
     John Ehlers - AutoTune Filter.
 
-    Что выдаёт индикатор:
+    Линии индикатора:
     - bp      : tuned band-pass filter
     - filt    : high-pass filtered series
     - mincorr : минимальная rolling autocorrelation
@@ -203,6 +203,7 @@ class AutoTuneDemoStrategy(bt.Strategy):
 
 if __name__ == '__main__':
     from moex_store import MoexStore
+    from cerebroview import plot
 
     cerebro = bt.Cerebro(stdstats=False)
 
@@ -221,7 +222,5 @@ if __name__ == '__main__':
         window=20,
         bandwidth=0.25,
     )
-    results = cerebro.run()
-
-    from cerebroview import plot
+    cerebro.run()
     plot(cerebro)

@@ -143,7 +143,6 @@ def _write_single_result_excel(sec, tf, settings, data, instrument_type, strateg
     except AttributeError:
         pass
 
-    return results_file
 
 
 def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_mode, sec, tf):
@@ -252,7 +251,7 @@ def run_single_plot_from_settings(settings):
         raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
 
     store = MoexStore()
-    datas, _ = load_moex_datas(
+    datas = load_moex_datas(
         store=store,
         sec=sec,
         instrument_type=instrument_type,
@@ -297,7 +296,7 @@ def run_optimization_from_settings(settings, maxcpus=None):
     total_time = _time.time()
     store = MoexStore()
 
-    datas, loaded_items = load_moex_datas(
+    datas = load_moex_datas(
         store=store,
         sec=sec,
         instrument_type=instrument_type,
@@ -543,9 +542,4 @@ def run_optimization_from_settings(settings, maxcpus=None):
 
     print(f"Результаты успешно сохранены в файл '{results_file}'.")
     os.startfile(results_file)
-
-
-def run(settings, maxcpus=None):
-    """Backward-compatible alias. New code should call run_optimization_from_settings()."""
-    return run_optimization_from_settings(settings, maxcpus=maxcpus)
 

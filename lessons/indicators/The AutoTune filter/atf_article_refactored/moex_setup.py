@@ -191,11 +191,8 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
                 fromdate = prevexpdate - timedelta(days=5)
 
             if contract == contracts[-1]:
-                todate = end_date
+                todate = end_date + timedelta(days=1)
             else:
-                # Загружаем небольшой запас после даты экспирации.
-                # Закрытие позиции дальше делается в стратегии по числу баров,
-                # оставшихся до конца текущего data feed.
                 todate = expdate + timedelta(days=1)
 
             data = store.getdata(
@@ -209,7 +206,7 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
             data.sec = sec
             datas.append(data)
 
-        return datas, contracts
+        return datas
 
     data = store.getdata(
         sec_id=sec,
@@ -222,6 +219,6 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
     data.sec = sec
     datas.append(data)
 
-    return datas, [sec]
+    return datas
 
 
