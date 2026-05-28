@@ -100,8 +100,6 @@ def add_drawdown_metrics(strategy, analysis):
 class SmartAnalyzer(Analyzer):
     """
     Возвращает основные метрики стратегии, trade-book и журнал финальных статусов ордеров.
-
-    В рабочей версии остаются только метрики, которые используются в итоговом Excel-файле.
     """
 
     params = dict(it_params=None, asset=None)
@@ -109,7 +107,6 @@ class SmartAnalyzer(Analyzer):
     def __init__(self):
         self.pt_arr = []
         self.lt_arr = []
-        # self.trades больше не нужен: notify_trade сразу формирует dict в trades_details.
         self.trades_details = []
         self.orders_details = []
         self.depos = self.strategy.broker.startingcash
@@ -128,8 +125,7 @@ class SmartAnalyzer(Analyzer):
             return ''
 
     def notify_order(self, order):
-        # Submitted/Accepted обычно только шумят журнал.
-        # Для диагностики нужны финальные статусы: Completed, Canceled, Margin, Rejected, Expired.
+
         if not self.strategy.p.write_history:
             return
 
@@ -193,10 +189,6 @@ class SmartAnalyzer(Analyzer):
         finish_cash = float(self.strategy.broker.getcash())
 
         if self.strategy.p.write_history:
-            # Раньше здесь складывался сам объект trade (с ссылками на ордера и
-            # bt.history), что тянуло память при больших оптимизациях.
-            # Теперь сразу собираем готовый dict — после notify_trade сам trade
-            # уже не нужен.
             entry_event = trade.history[0].event
             exit_event = trade.history[-1].event
             entry_order = entry_event.order
@@ -268,7 +260,6 @@ class SmartAnalyzer(Analyzer):
         self.rets['SumLoss'] = slt
         self.rets['AvgWin'] = aw
         self.rets['AvgLoss'] = al
-        # trades_details уже наполнен в notify_trade — здесь делать нечего.
 
     def get_trades(self):
         return self.trades_details

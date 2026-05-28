@@ -45,62 +45,68 @@ stocks_comm = dict(
 
 futures_comm = dict( # Комиссии для фьючерсов
     RTS=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=26358, # 27/04/25, 24700,  # ГО 05.12.2024 08-05-26
-                          mult=14.92418/10,  # мультипликатор Стоимость шага цены/Шаг цены 07-05-26 - 15.04492
+                          margin=26358, # 27/04/25
+                          mult=14.92418/10,  # мультипликатор Стоимость шага цены/Шаг цены
                           moexcomm=FUTURE_TYPE['xindex'],
                           cost_of_price_step=10),
-    RTSM=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=2900,  # 27/04/25, 2470,  # ГО 05.12.2024
+    RTSM=FuturesCommission(commission=2.0,
+                          margin=2900,  # 27/04/25
                           mult=8.26549/0.5,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex']),
-    NASD=FuturesCommission(commission=2.0,  # 2 руб за контракт
+                          moexcomm=FUTURE_TYPE['xindex'],
+                          cost_of_price_step=0.5),
+    NASD=FuturesCommission(commission=2.0,
                           margin=2607,  # ГО 05.12.2024
-                          mult=0.97966/1,  # мультипликатор Стоимость шага цены/Шаг цены
-                          moexcomm=FUTURE_TYPE['xindex']),
-    CNY=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=1050,  # ГО 27/04/25 27/04/26(!)
-                          mult=1/0.001,  # мультипликатор
+                          mult=0.97966/1,
+                          moexcomm=FUTURE_TYPE['xindex'],
+                          cost_of_price_step=1),
+    CNY=FuturesCommission(commission=2.0,
+                          margin=1050,  # ГО 27/04/26
+                          mult=1/0.001,
                           moexcomm=FUTURE_TYPE['currency'],
                           cost_of_price_step=0.001),
-    Si=FuturesCommission(commission=2.0,  # 2 руб за контракт
+    Si=FuturesCommission(commission=2.0,
                           margin=11779,  # ГО  05.12.2024 08-05-26
                           mult=1,  # мультипликатор
                           moexcomm=FUTURE_TYPE['currency'],
                           cost_of_price_step=1),
-    Eu=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=16000,  # ГО
-                          mult=1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['currency']),
-    NG=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=6300,  # ГО
-                          mult=9.8/0.001,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['commodity']),
-    GOLD=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=16600,  # ГО
-                          mult=9.8/0.1,  # мультипликатор
-                          moexcomm=FUTURE_TYPE['commodity']),
-    SBRF=FuturesCommission(commission=2.0,  # 2 руб за контракт
+    Eu=FuturesCommission(commission=2.0,
+                          margin=16000,
+                          mult=1,
+                          moexcomm=FUTURE_TYPE['currency'],
+                          cost_of_price_step=1),
+    NG=FuturesCommission(commission=2.0,
+                          margin=6300,
+                          mult=9.8/0.001,
+                          moexcomm=FUTURE_TYPE['commodity'],
+                          cost_of_price_step=0.001),
+    GOLD=FuturesCommission(commission=2.0,
+                          margin=16600,
+                          mult=9.8/0.1,
+                          moexcomm=FUTURE_TYPE['commodity'],
+                          cost_of_price_step=0.1),
+    SBRF=FuturesCommission(commission=2.0,
                           margin=4878.91 ,  # ГО 11-05-26
-                          mult=1,  # мультипликатор
+                          mult=1,
                           moexcomm=FUTURE_TYPE['stock'],
                           cost_of_price_step=1),
-    BR=FuturesCommission(commission=2.0,  # 2 руб за контракт
+    BR=FuturesCommission(commission=2.0,
                          margin=10374,  # ГО 30-12-24
-                         mult=10.167/ 0.01,  # мультипликатор
-                         moexcomm=FUTURE_TYPE['commodity']),
-    MIX=FuturesCommission(commission=2.0,  # 2 руб за контракт
+                         mult=10.167/ 0.01,
+                         moexcomm=FUTURE_TYPE['commodity'],
+                         cost_of_price_step=0.01),
+    MIX=FuturesCommission(commission=2.0,
                           margin=33000,  # - ГО 26-04-26
-                          mult=25 / 25,  # мультипликатор Стоимость шага цены/Шаг цены
+                          mult=25 / 25,
                           moexcomm=FUTURE_TYPE['xindex'],
                           cost_of_price_step=25),
-    MXI=FuturesCommission(commission=2.0,  # 2 руб за контракт
-                          margin=3500,  # - ГО 26-04-25, 3400 - ГО 07.02.2025
-                          mult=0.5 / 0.05,  # мультипликатор Стоимость шага цены/Шаг цены
+    MXI=FuturesCommission(commission=2.0,
+                          margin=3500,  # - ГО 26-04-25
+                          mult=0.5 / 0.05,
                           moexcomm=FUTURE_TYPE['xindex'],
                           cost_of_price_step=0.05),
-    SPYF=FuturesCommission(commission=2.0,  # 2 руб за контракт
+    SPYF=FuturesCommission(commission=2.0,
                           margin=4252.12 ,  # ГО 11-05-26
-                          mult=0.83563 / 0.01,  # мультипликатор Стоимость шага цены/Шаг цены
+                          mult=0.83563 / 0.01,
                           moexcomm=FUTURE_TYPE['xindex'],
                           cost_of_price_step=0.01))
 
