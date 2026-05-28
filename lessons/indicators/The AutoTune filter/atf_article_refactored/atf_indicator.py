@@ -14,7 +14,7 @@ class AutoTuneFilter(bt.Indicator):
 
     В конце файла есть AutoTuneDemoStrategy. Она не торгует, а только выводит
     линии индикатора на график через CerebroView, чтобы сверить значения с
-    TradingView или другой эталонной реализацией.
+    TradingView или другой "эталонной" реализацией.
     """
 
     lines = ('bp', 'filt', 'mincorr', 'dc')
@@ -32,6 +32,18 @@ class AutoTuneFilter(bt.Indicator):
         mincorr=dict(_name='MinCorr'),
         dc=dict(_name='DominantCycle'),  # , _plotskip=True
     )
+
+    def __init__(self):
+        # HP-коэффициенты зависят только от window и не меняются от бара к бару.
+        window = int(self.p.window)
+        w = 1.414 * math.pi / window
+        q = math.exp(-w)
+        self._hp_c1 = 2.0 * q * math.cos(w)
+        self._hp_c2 = q * q
+        self._hp_a0 = 0.25 * (1.0 + self._hp_c1 + self._hp_c2)
+        # Кэшируем int(window) для горячего пути.
+        self._window = window
+        self._autocorr_warmup = 2 * window + 1
 
     @staticmethod
     def _safe(value, default=0.0):
@@ -76,33 +88,35 @@ class AutoTuneFilter(bt.Indicator):
         self._step()
 
     def _step(self):
-        window = int(self.p.window)
+        window = self._window
         bandwidth = float(self.p.bandwidth)
+
+        filt_line = self.l.filt
+        bp_line = self.l.bp
+        data_line = self.data
 
         # =============================================================
         # 1) HIGH-PASS FILTER
         # =============================================================
 
-        w = 1.414 * math.pi / window
-        q = math.exp(-w)
-        c1 = 2.0 * q * math.cos(w)
-        c2 = q * q
-        a0 = 0.25 * (1.0 + c1 + c2)
+        c1 = self._hp_c1
+        c2 = self._hp_c2
+        a0 = self._hp_a0
 
         if len(self) < 5:
             filt = 0.0
         else:
-            src0 = self.data[0]
-            src1 = self.data[-1]
-            src2 = self.data[-2]
+            src0 = data_line[0]
+            src1 = data_line[-1]
+            src2 = data_line[-2]
 
             filt = (
                 a0 * (src0 - 2.0 * src1 + src2)
-                + c1 * self._prev(self.l.filt, -1, 0.0)
-                - c2 * self._prev(self.l.filt, -2, 0.0)
+                + c1 * self._prev(filt_line, -1, 0.0)
+                - c2 * self._prev(filt_line, -2, 0.0)
             )
 
-        self.l.filt[0] = filt
+        filt_line[0] = filt
 
         # =============================================================
         # 2) ROLLING AUTOCORRELATION
@@ -111,18 +125,31 @@ class AutoTuneFilter(bt.Indicator):
         mincorr = 1.0
         best_lag = 1
 
+        # Если истории уже точно хватает на весь цикл — идём по быстрому пути
+        # без _prev/_safe внутри. Иначе остаёмся на безопасном варианте.
+        warm = len(self) >= self._autocorr_warmup
+
         for lag in range(1, window + 1):
             sx = sy = sxx = sxy = syy = 0.0
 
-            for j in range(window):
-                x = self._prev(self.l.filt, -j, 0.0)
-                y = self._prev(self.l.filt, -(lag + j), 0.0)
-
-                sx += x
-                sy += y
-                sxx += x * x
-                sxy += x * y
-                syy += y * y
+            if warm:
+                for j in range(window):
+                    x = filt_line[-j]
+                    y = filt_line[-(lag + j)]
+                    sx += x
+                    sy += y
+                    sxx += x * x
+                    sxy += x * y
+                    syy += y * y
+            else:
+                for j in range(window):
+                    x = self._prev(filt_line, -j, 0.0)
+                    y = self._prev(filt_line, -(lag + j), 0.0)
+                    sx += x
+                    sy += y
+                    sxx += x * x
+                    sxy += x * y
+                    syy += y * y
 
             cov = window * sxy - sx * sy
             vx = window * sxx - sx * sx
@@ -153,7 +180,7 @@ class AutoTuneFilter(bt.Indicator):
         # 4) TUNED BAND-PASS FILTER
         # =============================================================
         if len(self) < 4:
-            self.l.bp[0] = 0.0
+            bp_line[0] = 0.0
             return
 
         w0 = 2.0 * math.pi / dc
@@ -163,7 +190,7 @@ class AutoTuneFilter(bt.Indicator):
         # Разумная численная защита: если g1 почти ноль,
         # сохраняем предыдущее значение, чтобы не словить деление на 0.
         if abs(g1) < 1e-12:
-            self.l.bp[0] = self._prev(self.l.bp, -1, 0.0)
+            bp_line[0] = self._prev(bp_line, -1, 0.0)
             return
 
         inner = 1.0 / (g1 * g1) - 1.0
@@ -174,17 +201,17 @@ class AutoTuneFilter(bt.Indicator):
         if inner < 0.0 and abs(inner) < 1e-12:
             inner = 0.0
         elif inner < 0.0:
-            self.l.bp[0] = self._prev(self.l.bp, -1, 0.0)
+            bp_line[0] = self._prev(bp_line, -1, 0.0)
             return
 
         s1 = 1.0 / g1 - math.sqrt(inner)
 
         bp = (
-            0.5 * (1.0 - s1) * (self.data[0] - self.data[-2])
-            + l1 * (1.0 + s1) * self._prev(self.l.bp, -1, 0.0)
-            - s1 * self._prev(self.l.bp, -2, 0.0)
+            0.5 * (1.0 - s1) * (data_line[0] - data_line[-2])
+            + l1 * (1.0 + s1) * self._prev(bp_line, -1, 0.0)
+            - s1 * self._prev(bp_line, -2, 0.0)
         )
-        self.l.bp[0] = bp
+        bp_line[0] = bp
 
 
 class AutoTuneDemoStrategy(bt.Strategy):
@@ -199,6 +226,16 @@ class AutoTuneDemoStrategy(bt.Strategy):
             window=self.p.window,
             bandwidth=self.p.bandwidth,
         )
+
+    # def next(self):
+    #     dt = self.data.datetime.datetime(0)
+    #     print(
+    #         f'{dt} | close={self.data.close[0]:.2f} | '
+    #         f'bp={self.atf.bp[0]:.6f} | '
+    #         f'filt={self.atf.filt[0]:.6f} | '
+    #         f'mincorr={self.atf.mincorr[0]:.6f} | '
+    #         f'dc={self.atf.dc[0]:.2f}'
+    #     )
 
 
 if __name__ == '__main__':
@@ -217,10 +254,6 @@ if __name__ == '__main__':
     )
 
     cerebro.adddata(data)
-    cerebro.addstrategy(
-        AutoTuneDemoStrategy,
-        window=20,
-        bandwidth=0.25,
-    )
+    cerebro.addstrategy(AutoTuneDemoStrategy)
     cerebro.run()
     plot(cerebro)

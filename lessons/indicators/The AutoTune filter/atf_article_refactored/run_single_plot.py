@@ -13,7 +13,6 @@ STRATEGY_PARAMS = dict(
     allow_short=False,
     printlog=False,
     tp_mult=0.45,
-    min_dc=0,
 )
 
 RUN_SETTINGS = dict(

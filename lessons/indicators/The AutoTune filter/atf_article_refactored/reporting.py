@@ -109,7 +109,7 @@ class SmartAnalyzer(Analyzer):
     def __init__(self):
         self.pt_arr = []
         self.lt_arr = []
-        self.trades = []
+        # self.trades больше не нужен: notify_trade сразу формирует dict в trades_details.
         self.trades_details = []
         self.orders_details = []
         self.depos = self.strategy.broker.startingcash
@@ -193,12 +193,50 @@ class SmartAnalyzer(Analyzer):
         finish_cash = float(self.strategy.broker.getcash())
 
         if self.strategy.p.write_history:
-            trade.start_cash = self.depos
-            trade.finish_cash = finish_cash
-            trade.stop_loss_price = self.strategy.stop_loss_price
-            trade.take_profit_price = self.strategy.take_profit_price
-            trade.sec_id = trade.getdataname()
-            self.trades.append(trade)
+            # Раньше здесь складывался сам объект trade (с ссылками на ордера и
+            # bt.history), что тянуло память при больших оптимизациях.
+            # Теперь сразу собираем готовый dict — после notify_trade сам trade
+            # уже не нужен.
+            entry_event = trade.history[0].event
+            exit_event = trade.history[-1].event
+            entry_order = entry_event.order
+            exit_order = exit_event.order
+
+            self.trades_details.append(dict(
+                params=self._params_str(),
+                sec=trade.getdataname(),
+                entry_ref=entry_order.ref,
+                entry_created_date=f'{bt.num2date(entry_order.created.dt):%d.%m.%y}',
+                entry_created_time=f'{bt.num2date(entry_order.created.dt):%H:%M}',
+                entry_executed_time=f'{bt.num2date(entry_order.executed.dt):%H:%M}',
+                entry_requested_price=entry_order.created.price,
+                entry_executed_price=entry_order.executed.price,
+                stop_loss_price=getattr(
+                    entry_order.info,
+                    'planned_stop_loss_price',
+                    getattr(self.strategy, 'stop_loss_price', 0),
+                ),
+                take_profit_price=getattr(
+                    entry_order.info,
+                    'planned_take_profit_price',
+                    getattr(self.strategy, 'take_profit_price', 0),
+                ),
+                planned_risk_points=getattr(entry_order.info, 'planned_risk_points', 0),
+                size=entry_order.size,
+                entry_type='long' if entry_order.isbuy() else 'short',
+                exit_ref=exit_order.ref,
+                exit_created_date=f'{bt.num2date(exit_order.created.dt):%d.%m.%y}',
+                exit_created_time=f'{bt.num2date(exit_order.created.dt):%H:%M}',
+                exit_executed_date=f'{bt.num2date(exit_order.executed.dt):%d.%m.%y}',
+                exit_executed_time=f'{bt.num2date(exit_order.executed.dt):%H:%M}',
+                exit_requested_price=exit_order.created.price,
+                exit_executed_price=exit_order.executed.price,
+                exit_type=getattr(exit_order.info, 'name', ''),
+                result=1 if trade.pnl > 0 else 0,
+                pnl=int(trade.pnlcomm),
+                cash_before=self.depos,
+                cash_after=finish_cash,
+            ))
 
         self.depos = finish_cash
 
@@ -230,51 +268,7 @@ class SmartAnalyzer(Analyzer):
         self.rets['SumLoss'] = slt
         self.rets['AvgWin'] = aw
         self.rets['AvgLoss'] = al
-
-        if not self.strategy.p.write_history:
-            return
-
-        for trade in self.trades:
-            entry_event = trade.history[0].event
-            exit_event = trade.history[-1].event
-            entry_order = entry_event.order
-            exit_order = exit_event.order
-
-            self.trades_details.append(dict(
-                params=params_str,
-                sec=getattr(trade, 'sec_id', 0),
-                entry_ref=entry_order.ref,
-                entry_created_date=f'{bt.num2date(entry_order.created.dt):%d.%m.%y}',
-                entry_created_time=f'{bt.num2date(entry_order.created.dt):%H:%M}',
-                entry_executed_time=f'{bt.num2date(entry_order.executed.dt):%H:%M}',
-                entry_requested_price=entry_order.created.price,
-                entry_executed_price=entry_order.executed.price,
-                stop_loss_price=getattr(
-                    entry_order.info,
-                    'planned_stop_loss_price',
-                    getattr(trade, 'stop_loss_price', 0),
-                ),
-                take_profit_price=getattr(
-                    entry_order.info,
-                    'planned_take_profit_price',
-                    getattr(trade, 'take_profit_price', 0),
-                ),
-                planned_risk_points=getattr(entry_order.info, 'planned_risk_points', 0),
-                size=entry_order.size,
-                entry_type='long' if entry_order.isbuy() else 'short',
-                exit_ref=exit_order.ref,
-                exit_created_date=f'{bt.num2date(exit_order.created.dt):%d.%m.%y}',
-                exit_created_time=f'{bt.num2date(exit_order.created.dt):%H:%M}',
-                exit_executed_date=f'{bt.num2date(exit_order.executed.dt):%d.%m.%y}',
-                exit_executed_time=f'{bt.num2date(exit_order.executed.dt):%H:%M}',
-                exit_requested_price=exit_order.created.price,
-                exit_executed_price=exit_order.executed.price,
-                exit_type=getattr(exit_order.info, 'name', ''),
-                result=1 if trade.pnl > 0 else 0,
-                pnl=int(trade.pnlcomm),
-                cash_before=getattr(trade, 'start_cash', 0),
-                cash_after=getattr(trade, 'finish_cash', 0),
-            ))
+        # trades_details уже наполнен в notify_trade — здесь делать нечего.
 
     def get_trades(self):
         return self.trades_details

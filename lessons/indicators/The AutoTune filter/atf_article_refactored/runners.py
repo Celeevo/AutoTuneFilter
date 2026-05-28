@@ -15,26 +15,14 @@ from moex_setup import get_commission_info, load_moex_datas, normalize_instrumen
 from params_tools import count_param_variants, expand_param_combinations, iterable_params, to_single_strategy_params
 from reporting import SmartAnalyzer, add_drawdown_metrics, aggregate_df
 
-_OPT_PBAR = None
 
-
-def opt_progress_cb(_):
-    global _OPT_PBAR
-    if _OPT_PBAR is not None:
-        _OPT_PBAR.update(1)
-
+# -------------------------- helpers --------------------------
 
 def _script_version():
+    """Версия запускаемого скрипта для имени файла с результатами."""
     script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
     match = re.search(r'(prod\d+)', script_name, re.IGNORECASE)
     return match.group(1).lower() if match else script_name
-
-
-def _set_script_version():
-    global SCRIPT_VERSION
-    SCRIPT_VERSION = _script_version()
-
-SCRIPT_VERSION = _script_version()
 
 
 def _data_name(data):
@@ -44,6 +32,68 @@ def _data_name(data):
 def _available_data_names(datas):
     return [_data_name(data) for data in datas]
 
+
+def _strategy_cls(exit_mode):
+    return AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
+
+
+# Активный tqdm-прогрессбар оптимизации.
+_opt_pbar = None
+
+
+def _opt_progress_callback(_strats):
+    """Top-level progress callback для cerebro.optcallback (Windows-safe pickle)."""
+    pbar = _opt_pbar
+    if pbar is not None:
+        pbar.update(1)
+
+
+def _build_cerebro(data, instrument_type, start_cash, analyzer_params):
+    """
+    Стандартная сборка cerebro: брокер, кэш, комиссия по data.sec, аналайзеры,
+    добавленный data feed. Используется и в одиночном прогоне, и в обеих
+    ветках оптимизации (fixed / cumulative).
+    """
+    cerebro = bt.Cerebro()
+    cerebro.broker = bt.brokers.BackBroker()
+    cerebro.broker.setcash(start_cash)
+    cerebro.broker.addcommissioninfo(
+        get_commission_info(data.sec, instrument_type),
+        name=data.p.name,
+    )
+    cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
+    cerebro.adddata(data)
+    return cerebro
+
+
+def _collect_run_results(strategy, data, capital_mode, write_history):
+    """
+    Собирает результат одной отработанной стратегии: analysis-словарь
+    с метриками + готовые trades/orders detail-списки.
+    Возвращает (analysis, trades, orders).
+    """
+    analyzer = strategy.analyzers.full
+    analysis = dict(analyzer.get_analysis())
+    add_drawdown_metrics(strategy, analysis)
+    analysis['Data'] = data.p.name
+    analysis['PNLs'] = analyzer.get_trades_pnl()
+    analysis['CapitalMode'] = capital_mode
+
+    trades = []
+    orders = []
+    if write_history:
+        for row in analyzer.get_trades():
+            row['capital_mode'] = capital_mode
+            trades.append(row)
+        for row in analyzer.get_orders():
+            row['capital_mode'] = capital_mode
+            orders.append(row)
+
+    return analysis, trades, orders
+
+
+# -------------------------- single plot --------------------------
 
 def _select_single_plot_data(settings, datas, instrument_type, sec):
     """
@@ -144,7 +194,6 @@ def _write_single_result_excel(sec, tf, settings, data, instrument_type, strateg
         pass
 
 
-
 def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_mode, sec, tf):
     """
     Запускает один прогон через cerebro.addstrategy(), сохраняет Excel
@@ -158,25 +207,13 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
         show_equity_dd=True,
     )
 
-    strategy_cls = AutoTuneFilterStrategy if exit_mode == 'bracket' else AutoTuneFilterEhlersStrategy
-
-    cerebro = bt.Cerebro(stdstats=True, runonce=False)
-    cerebro.broker = bt.brokers.BackBroker()
-    cerebro.broker.setcash(start_cash)
-    cerebro.broker.addcommissioninfo(
-        get_commission_info(data.sec, instrument_type),
-        name=data.p.name,
-    )
-
-    cerebro.adddata(data)
-    cerebro.addstrategy(strategy_cls, **strategy_params)
-
     analyzer_params = dict(
         it_params=iterable_params(strategy_params),
         asset=data.sec,
     )
-    cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
+    cerebro = _build_cerebro(data, instrument_type, start_cash, analyzer_params)
+    # Для одиночного прогона хотим стандартные обсерверы.
+    cerebro.addstrategy(_strategy_cls(exit_mode), **strategy_params)
 
     print(
         f"[single_plot] Запуск {_data_name(data)} | instrument_type={instrument_type} | "
@@ -233,8 +270,6 @@ def run_single_plot(settings, datas, instrument_type, params, start_cash, exit_m
 
 def run_single_plot_from_settings(settings):
     """Публичный вход для run_single_plot.py."""
-    _set_script_version()
-
     if settings is None:
         raise ValueError('settings must be provided')
 
@@ -272,11 +307,161 @@ def run_single_plot_from_settings(settings):
     )
 
 
+# -------------------------- optimization --------------------------
+
+def _run_fixed_capital(datas, params, instrument_type, start_cash, exit_mode,
+                       analyzer_params, capital_mode, variants, maxcpus):
+    """
+    Режим 'fixed': каждый контракт независимо тестируется на всей сетке
+    через cerebro.optstrategy(). Стартовый капитал одинаковый для всех.
+    """
+    results, trades, orders = [], [], []
+    write_history = params.get('write_history', False)
+    strategy_cls = _strategy_cls(exit_mode)
+
+    for data in datas:
+        analyzer_params['asset'] = data.sec
+        st_time = _time.time()
+
+        cerebro = _build_cerebro(data, instrument_type, start_cash, analyzer_params)
+        cerebro.optstrategy(strategy_cls, **params)
+
+        pbar = None
+        if tqdm is not None:
+            pbar = tqdm(
+                total=variants,
+                desc=data.p.name,
+                dynamic_ncols=True,
+                unit='var',
+                file=sys.stdout,
+            )
+            # Регистрируем pbar как module-level state и top-level callback.
+            # Closure здесь нельзя: optcallback хранится в cerebro и пиклится
+            # в worker'ы — local-функция ломает pickle на Windows.
+            globals()['_opt_pbar'] = pbar
+            cerebro.optcallback(_opt_progress_callback)
+
+        try:
+            runs = cerebro.run(stdstats=False, tradehistory=write_history, maxcpus=maxcpus)
+        finally:
+            if pbar is not None:
+                pbar.close()
+                globals()['_opt_pbar'] = None
+
+        for run in runs:                  # все варианты по одному контракту
+            for strategy in run:          # уникальные варианты по параметрам
+                analysis, tr, ords = _collect_run_results(
+                    strategy, data, capital_mode, write_history
+                )
+                results.append(analysis)
+                trades.extend(tr)
+                orders.extend(ords)
+
+        elapsed = _time.time() - st_time
+        print(
+            f'Прогон {len(runs)} вариантов стратегии для контракта '
+            f'{data.p.name} за {round(elapsed, 2)} сек., '
+            f'{round(elapsed / 60, 2)} мин., '
+            f'V (скорость) = {round(len(runs) / elapsed, 2)} вар/сек, '
+            f'{str(datetime.now().time())[:5]}'
+        )
+        gc.collect()
+
+    return results, trades, orders
+
+
+def _run_cumulative_capital(datas, params, instrument_type, start_cash, exit_mode,
+                            analyzer_params, capital_mode):
+    """
+    Кумулятивный режим: одна комбинация параметров последовательно проходит
+    все контракты. Финальная стоимость счёта после контракта N становится
+    стартовым капиталом для контракта N+1 той же комбинации параметров.
+    """
+    results, trades, orders = [], [], []
+    write_history = params.get('write_history', False)
+    strategy_cls = _strategy_cls(exit_mode)
+
+    param_variants = list(expand_param_combinations(params))
+    total_runs = len(param_variants) * len(datas)
+
+    pbar = None
+    if tqdm is not None:
+        pbar = tqdm(
+            total=total_runs,
+            desc='cumulative',
+            dynamic_ncols=True,
+            unit='run',
+            file=sys.stdout,
+        )
+
+    for variant_no, strategy_params in enumerate(param_variants, start=1):
+        current_cash = start_cash
+        variant_time = _time.time()
+
+        for data in datas:
+            analyzer_params['asset'] = data.sec
+            st_time = _time.time()
+
+            cerebro = _build_cerebro(data, instrument_type, current_cash, analyzer_params)
+            cerebro.addstrategy(strategy_cls, **strategy_params)
+
+            runs = cerebro.run(stdstats=False, tradehistory=write_history)
+            strategy = runs[0]
+
+            analysis, tr, ords = _collect_run_results(
+                strategy, data, capital_mode, write_history
+            )
+            results.append(analysis)
+            trades.extend(tr)
+            orders.extend(ords)
+
+            # Финальная стоимость счёта становится стартом следующего контракта.
+            # Позиция закрывается за DATA_END_EXIT_BARS баров до конца data feed,
+            # поэтому EndValue не должен включать незакрытый mark-to-market хвост.
+            current_cash = analysis.get('EndValue', cerebro.broker.getvalue())
+
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix_str(f'{variant_no}/{len(param_variants)} {data.p.name}')
+
+            print(
+                f'Кумулятивный прогон {variant_no}/{len(param_variants)}, '
+                f'контракт {data.p.name}: start={analysis.get("StartCash", 0):.2f}, '
+                f'end={analysis.get("EndValue", 0):.2f}, '
+                f'PNL={analysis.get("ContractPNL", 0):.2f}, '
+                f'{round(_time.time() - st_time, 2)} сек., '
+                f'{str(datetime.now().time())[:5]}'
+            )
+            gc.collect()
+
+        print(
+            f'Комбинация {variant_no}/{len(param_variants)} прошла все контракты за '
+            f'{round((_time.time() - variant_time) / 60, 2)} мин.'
+        )
+
+    if pbar is not None:
+        pbar.close()
+
+    return results, trades, orders
+
+
+def _write_optimization_excel(results_file, df1, df3, df4, df_trades, df_orders,
+                              sheet_size, instrument_type, write_history):
+    """Запись итоговых листов оптимизации в xlsx."""
+    with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
+        if not sheet_size:
+            if instrument_type == 'futures':
+                df1.to_excel(writer, sheet_name='by Contracts', index=False)
+            if write_history:
+                df_trades.to_excel(writer, sheet_name='trades', index=False)
+                if not df_orders.empty:
+                    df_orders.to_excel(writer, sheet_name='orders', index=False)
+        df3.to_excel(writer, sheet_name='results', index=False)
+        df4.to_excel(writer, sheet_name='params', index=False)
+
+
 def run_optimization_from_settings(settings, maxcpus=None):
     # Фильтр AutoTune https://financial-hacker.com/the-autotune-filter/
-    global _OPT_PBAR
-    _set_script_version()
-
     if settings is None:
         raise ValueError('settings must be provided')
 
@@ -317,9 +502,6 @@ def run_optimization_from_settings(settings, maxcpus=None):
           f'{variants * len(datas)} вариантов.')
     print(f'Время пошло, {datetime.now():%H:%M:%S}')
 
-    results = []
-    trades = []
-    orders = []
     analyzer_params = dict(it_params=iterable_params(params))
 
     if instrument_type == 'stocks':
@@ -335,175 +517,41 @@ def run_optimization_from_settings(settings, maxcpus=None):
         raise ValueError("exit_mode должен быть 'bracket' или 'ehlers'")
 
     if capital_mode == 'fixed':
-        # Старый режим: каждый контракт тестируется независимо и стартует
-        # с одинакового депозита start_cash.
-        for data in datas:
-            analyzer_params['asset'] = data.sec
-            st_time = _time.time()
-            cerebro = bt.Cerebro()
-            cerebro.broker = bt.brokers.BackBroker()
-            cerebro.broker.setcash(start_cash)
-            cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type), name=data.p.name)
-            cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
-            cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
-            cerebro.adddata(data)
-
-            strategy_params = dict(params)
-            if exit_mode == 'bracket':
-                cerebro.optstrategy(AutoTuneFilterStrategy, **strategy_params)
-            else:
-                cerebro.optstrategy(AutoTuneFilterEhlersStrategy, **strategy_params)
-            if tqdm is not None:
-                _OPT_PBAR = tqdm(
-                    total=variants,
-                    desc=data.p.name,
-                    dynamic_ncols=True,
-                    unit='var',
-                    file=sys.stdout,
-                )
-                cerebro.optcallback(opt_progress_cb)
-
-            runs = cerebro.run(stdstats=False, tradehistory=params.get('write_history', False), maxcpus=maxcpus)
-
-            if _OPT_PBAR is not None:
-                _OPT_PBAR.close()
-                _OPT_PBAR = None
-
-            for run in runs:  # тут все варианты для одного контракта
-                for strategy in run:  # тут уникальные варианты по параметрам
-                    analyzer = strategy.analyzers.full
-                    analysis = dict()
-                    analysis.update(analyzer.get_analysis())
-                    add_drawdown_metrics(strategy, analysis)
-                    analysis['Data'] = data.p.name
-                    analysis['PNLs'] = analyzer.get_trades_pnl()
-                    analysis['CapitalMode'] = capital_mode
-                    results.append(analysis)
-
-                    if params.get('write_history', False):
-                        trades_data = analyzer.get_trades()
-                        for tr in trades_data:
-                            tr['capital_mode'] = capital_mode
-                        trades.extend(trades_data)
-
-                        orders_data = analyzer.get_orders()
-                        for order_row in orders_data:
-                            order_row['capital_mode'] = capital_mode
-                        orders.extend(orders_data)
-
-            print(
-                f'Прогон {len(runs)} вариантов стратегии для контракта '
-                f'{data.p.name} за {round(_time.time() - st_time, 2)} сек., '
-                f'{round((_time.time() - st_time) / 60, 2)} мин., '
-                f'V (скорость) = {round(len(runs) / (_time.time() - st_time), 2)} вар/сек, '
-                f'{str(datetime.now().time())[:5]}'
-            )
-            gc.collect()
-
+        results, trades, orders = _run_fixed_capital(
+            datas=datas,
+            params=params,
+            instrument_type=instrument_type,
+            start_cash=start_cash,
+            exit_mode=exit_mode,
+            analyzer_params=analyzer_params,
+            capital_mode=capital_mode,
+            variants=variants,
+            maxcpus=maxcpus,
+        )
     else:
-        # Кумулятивный режим: одна комбинация параметров последовательно проходит
-        # все контракты. Финальная стоимость счёта после контракта N становится
-        # стартовым капиталом для контракта N+1 той же комбинации параметров.
-        param_variants = list(expand_param_combinations(params))
-        total_runs = len(param_variants) * len(datas)
-
-        if tqdm is not None:
-            _OPT_PBAR = tqdm(
-                total=total_runs,
-                desc='cumulative',
-                dynamic_ncols=True,
-                unit='run',
-                file=sys.stdout,
-            )
-
-        for variant_no, strategy_params in enumerate(param_variants, start=1):
-            current_cash = start_cash
-            variant_time = _time.time()
-
-            for data in datas:
-                analyzer_params['asset'] = data.sec
-                st_time = _time.time()
-
-                cerebro = bt.Cerebro()
-                cerebro.broker = bt.brokers.BackBroker()
-                cerebro.broker.setcash(current_cash)
-                cerebro.broker.addcommissioninfo(get_commission_info(data.sec, instrument_type), name=data.p.name)
-                cerebro.addanalyzer(SmartAnalyzer, _name='full', **analyzer_params)
-                cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
-                cerebro.adddata(data)
-                run_strategy_params = dict(strategy_params)
-                if exit_mode == 'bracket':
-                    cerebro.addstrategy(AutoTuneFilterStrategy, **run_strategy_params)
-                else:
-                    cerebro.addstrategy(AutoTuneFilterEhlersStrategy, **run_strategy_params)
-
-                runs = cerebro.run(stdstats=False, tradehistory=params.get('write_history', False))
-                strategy = runs[0]
-                analyzer = strategy.analyzers.full
-
-                analysis = dict()
-                analysis.update(analyzer.get_analysis())
-                add_drawdown_metrics(strategy, analysis)
-                analysis['Data'] = data.p.name
-                analysis['PNLs'] = analyzer.get_trades_pnl()
-                analysis['CapitalMode'] = capital_mode
-                results.append(analysis)
-
-                if params.get('write_history', False):
-                    trades_data = analyzer.get_trades()
-                    for tr in trades_data:
-                        tr['capital_mode'] = capital_mode
-                    trades.extend(trades_data)
-
-                    orders_data = analyzer.get_orders()
-                    for order_row in orders_data:
-                        order_row['capital_mode'] = capital_mode
-                    orders.extend(orders_data)
-
-                # Для следующего контракта используем финальную стоимость счёта.
-                # Позиция закрывается за DATA_END_EXIT_BARS баров до конца data feed,
-                # поэтому EndValue не должен включать незакрытый mark-to-market хвост.
-                current_cash = analysis.get('EndValue', cerebro.broker.getvalue())
-
-                if _OPT_PBAR is not None:
-                    _OPT_PBAR.update(1)
-                    _OPT_PBAR.set_postfix_str(f'{variant_no}/{len(param_variants)} {data.p.name}')
-
-                print(
-                    f'Кумулятивный прогон {variant_no}/{len(param_variants)}, '
-                    f'контракт {data.p.name}: start={analysis.get("StartCash", 0):.2f}, '
-                    f'end={analysis.get("EndValue", 0):.2f}, '
-                    f'PNL={analysis.get("ContractPNL", 0):.2f}, '
-                    f'{round(_time.time() - st_time, 2)} сек., '
-                    f'{str(datetime.now().time())[:5]}'
-                )
-                gc.collect()
-
-            print(
-                f'Комбинация {variant_no}/{len(param_variants)} прошла все контракты за '
-                f'{round((_time.time() - variant_time) / 60, 2)} мин.'
-            )
-
-        if _OPT_PBAR is not None:
-            _OPT_PBAR.close()
-            _OPT_PBAR = None
+        results, trades, orders = _run_cumulative_capital(
+            datas=datas,
+            params=params,
+            instrument_type=instrument_type,
+            start_cash=start_cash,
+            exit_mode=exit_mode,
+            analyzer_params=analyzer_params,
+            capital_mode=capital_mode,
+        )
 
     print(f'Весь прогон за {round(_time.time() - total_time, 2)} сек., '
           f'{round((_time.time() - total_time) / 3600, 2)} часов.')
 
+    write_history = params.get('write_history', False)
+
     df1 = pd.DataFrame(results).round(2)
-    if params.get('write_history', False):
-        df2 = pd.DataFrame(trades).round(3)
-        df_orders = pd.DataFrame(orders).round(3)
+    df_trades = pd.DataFrame(trades).round(3) if write_history else pd.DataFrame()
+    df_orders = pd.DataFrame(orders).round(3) if write_history else pd.DataFrame()
     df3 = aggregate_df(df1, start_cash, sort_by=main_opt_metric)
 
-    # В results оставляем только основные метрики. MaxDDLen скрываем, потому что
-    # для статьи достаточно MaxDDPct и MaxDDMoney.
-    results_drop_cols = [
-        'MaxDDLen',
-        'Asset',
-    ]
+    results_drop_cols = ['MaxDDLen', 'Asset']
     df3 = df3.drop(columns=[col for col in results_drop_cols if col in df3.columns])
+
     df4 = pd.DataFrame(
         list(params.items()) + [
             ('start_cash', start_cash),
@@ -514,32 +562,31 @@ def run_optimization_from_settings(settings, maxcpus=None):
             ('start_date', start_date),
             ('end_date', end_date),
         ],
-        columns=['Parameter', 'Value']
+        columns=['Parameter', 'Value'],
     )
+
     for col in ('PNLs', 'Asset'):
         if col in df1.columns:
             del df1[col]
 
-    # Сохраняем штамп времени для имени XLSX-файла с результатами
     timestamp = datetime.now().strftime("%d-%m-%y %H-%M")
+    script_version = _script_version()
+    results_file = f'opt_results_{script_version}_{sec}_{tf}_{timestamp}.xlsx'
 
-    # Создаём имя XLSX-файла результатов. Версия берётся из имени
-    # запускаемого скрипта: например, atf_strat_opt4_xlsx_prod12.py -> prod12.
-    results_file = f'opt_results_{SCRIPT_VERSION}_{sec}_{tf}_{timestamp}.xlsx'
-
-    # Записываем df в xlsx файл, xlsxwriter импортируем
-    # отдельно pip install xlsxwriter
-    with pd.ExcelWriter(results_file, engine='xlsxwriter') as writer:
-        if not sheet_size:
-            if instrument_type == 'futures':
-                df1.to_excel(writer, sheet_name='by Contracts', index=False)
-            if params.get('write_history', False):
-                df2.to_excel(writer, sheet_name='trades', index=False)
-                if not df_orders.empty:
-                    df_orders.to_excel(writer, sheet_name='orders', index=False)
-        df3.to_excel(writer, sheet_name='results', index=False)
-        df4.to_excel(writer, sheet_name='params', index=False)
+    _write_optimization_excel(
+        results_file=results_file,
+        df1=df1,
+        df3=df3,
+        df4=df4,
+        df_trades=df_trades,
+        df_orders=df_orders,
+        sheet_size=sheet_size,
+        instrument_type=instrument_type,
+        write_history=write_history,
+    )
 
     print(f"Результаты успешно сохранены в файл '{results_file}'.")
-    os.startfile(results_file)
-
+    try:
+        os.startfile(results_file)
+    except AttributeError:
+        pass

@@ -35,9 +35,6 @@ class EquityDrawDownIndicator(bt.Indicator):
         plotname='Equity / DD',
     )
 
-    # _method='bar' — стандартная для Backtrader подсказка отрисовщику:
-    # показывать линию не обычной кривой, а столбцами. CerebroView должен
-    # читать эти plotline-настройки при auto-discovery индикаторов.
     plotlines = dict(
         equity_pnl=dict(_name='Equity PnL', _method='bar'),
         drawdown=dict(_name='Drawdown', _method='bar'),
@@ -67,13 +64,11 @@ class EquityDrawDownIndicator(bt.Indicator):
 
 class AutoTuneFilterStrategy(bt.Strategy):
     """
-    Оригинальная стратегия Элерса:
+    Сигналы на вход - как в оригинальная стратегия Элерса:
     - ROC = BP - BP[2]
     - Long  when ROC crosses above 0 and MinCorr < Thresh
     - Short when ROC crosses below 0 and MinCorr < Thresh and Filt > 0
-
-    К оригинальным критериям Элерса добавлен фильтр min_dc:
-    сделки не открываются, если dominant cycle ниже заданного порога.
+    Выход - bracket-ордера - по стоп-лоссу или тайк-профиту.
     """
 
     params = dict(
@@ -85,7 +80,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
         allow_short=True,
         printlog=False,
         tp_mult=2.0,   # тейк-профит в R
-        min_dc=0,      # минимальный dominant cycle AutoTune для входа, в барах
         show_equity_dd=False,  # в single_plot выводить Equity PnL / Drawdown как индикатор CerebroView
     )
 
@@ -114,14 +108,12 @@ class AutoTuneFilterStrategy(bt.Strategy):
         self.long_signal = bt.And(
             self.cross_up,
             self.atf.mincorr < self.p.thresh,
-            self.atf.dc >= self.p.min_dc,
         )
 
         self.short_signal = bt.And(
             self.cross_down,
             self.atf.mincorr < self.p.thresh,
             self.atf.filt > 0,
-            self.atf.dc >= self.p.min_dc,
         )
 
         self.stop_loss_price = 0.0
@@ -176,16 +168,33 @@ class AutoTuneFilterStrategy(bt.Strategy):
         """
         Уменьшает size так, чтобы хватало денег не только на ГО/стоимость,
         но и на комиссию входного ордера.
+
         """
         size = int(size)
+        if size <= 0:
+            return 0
 
-        while size > 0:
-            _, _, total_required = self._estimate_entry_cost(comminfo, price, size)
+        # Берём верхнюю оценку cost_per_unit через текущий size.
+        # Если cost_per_unit нулевой (нет ГО и нет комиссии) — пускаем
+        # как есть.
+        _, _, total_required = self._estimate_entry_cost(comminfo, price, size)
+        if total_required <= cash:
+            return size
 
+        cost_per_unit = total_required / size
+        if cost_per_unit <= 0:
+            return size
+
+        fitted = int(cash // cost_per_unit)
+
+        # Перепроверяем — комиссия может слегка отличаться при переходе к
+        # меньшему size (например, если у CommInfo есть нелинейные надбавки).
+        # Если в полученное значение всё ещё не вписываемся, спускаемся на 1.
+        while fitted > 0:
+            _, _, total_required = self._estimate_entry_cost(comminfo, price, fitted)
             if total_required <= cash:
-                return size
-
-            size -= 1
+                return fitted
+            fitted -= 1
 
         return 0
 
@@ -321,20 +330,13 @@ class AutoTuneFilterStrategy(bt.Strategy):
         order_name = getattr(order.info, 'name', None)
 
         if order.status == order.Completed:
-            if order_name == 'long':
-                self.log(f'BUY EXECUTED at {order.executed.price:.2f}')
+            if order_name in ('long', 'short'):
+                action = 'BUY' if order_name == 'long' else 'SELL'
+                self.log(f'{action} EXECUTED at {order.executed.price:.2f}')
                 self.order = None
-            elif order_name == 'short':
-                self.log(f'SELL EXECUTED at {order.executed.price:.2f}')
-                self.order = None
-            elif order_name == 'stop_loss':
-                self.log(f'STOP LOSS EXECUTED at {order.executed.price:.2f}')
-                self._reset_bracket_state()
-            elif order_name == 'take_profit':
-                self.log(f'TAKE PROFIT EXECUTED at {order.executed.price:.2f}')
-                self._reset_bracket_state()
-            elif order_name == 'data_end_close':
-                self.log(f'DATA END CLOSE EXECUTED at {order.executed.price:.2f}')
+            elif order_name in ('stop_loss', 'take_profit', 'data_end_close'):
+                label = order_name.replace('_', ' ').upper()
+                self.log(f'{label} EXECUTED at {order.executed.price:.2f}')
                 self._reset_bracket_state()
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
@@ -352,8 +354,6 @@ class AutoTuneFilterStrategy(bt.Strategy):
     def next(self):
         # Перед завершением текущего data feed не открываем новые сделки.
         # Если позиция ещё открыта, заранее отправляем рыночный close().
-        # В обычном режиме Backtrader close() исполнится на следующем баре,
-        # поэтому сигнал на закрытие нужно отправлять ДО последнего бара.
         if self._is_data_end_exit_window():
             if self.position:
                 self._submit_data_end_close()
