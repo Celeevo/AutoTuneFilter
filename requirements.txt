@@ -1,0 +1,6 @@
+backtrader
+moex-store
+pandas
+numpy
+xlsxwriter
+tqdm
