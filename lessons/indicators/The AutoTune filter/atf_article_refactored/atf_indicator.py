@@ -124,9 +124,6 @@ class AutoTuneFilter(bt.Indicator):
 
         mincorr = 1.0
         best_lag = 1
-
-        # Если истории уже точно хватает на весь цикл — идём по быстрому пути
-        # без _prev/_safe внутри. Иначе остаёмся на безопасном варианте.
         warm = len(self) >= self._autocorr_warmup
 
         for lag in range(1, window + 1):
