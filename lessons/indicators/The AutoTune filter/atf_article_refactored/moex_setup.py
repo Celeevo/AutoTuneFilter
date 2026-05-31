@@ -191,7 +191,7 @@ def load_moex_datas(store, sec, instrument_type, start_date, end_date, tf):
                 fromdate = prevexpdate - timedelta(days=5)
 
             if contract == contracts[-1]:
-                todate = end_date + timedelta(days=1)
+                todate = pd.to_datetime(end_date) + timedelta(days=1)
             else:
                 todate = expdate + timedelta(days=1)
 
